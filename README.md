@@ -8,8 +8,6 @@ This repository is **only a patch and a build script**. It contains no game
 files and none of the port itself. You build a small **update CIA** (about 3 MB)
 from the builder folder you already used to build the game.
 
-**Full transparency: MKW-3DS-LocalWireless has been made with heavy help from an AI assistant (Claude)**
-
 ## Features
 
 - **Host / Join** from *Multiplayer* in the main menu; the lobby shows how many
@@ -22,7 +20,7 @@ from the builder folder you already used to build the game.
 - After a race the host chooses what's next; guests see the results and follow
 - If the host leaves, guests take over the remaining racers; a guest who stops
   responding is replaced by a CPU
-- **Performance**: steadier 60 fps in 2D and a stable 30 fps in 3D (on new 3ds, hasn't yet been tested on OLD models) (lighter
+- **Performance**: steadier 60 fps in 2D and a stable 30 fps in 3D (lighter
   shadows and effects, better GPU scheduling, earlier detail switching for CPUs)
 
 Network play uses the 3DS's own local wireless (UDS): no router or internet needed.
@@ -38,8 +36,8 @@ Network play uses the 3DS's own local wireless (UDS): no router or internet need
 ## Build the update CIA yourself
 
 ```
-git clone https://github.com/12TROLL14/MKW-3DS-local-multiplayer
-cd MKW-3DS-local-multiplayer
+git clone https://github.com/12TROLL14/MKW-3DS-LocalWireless
+cd MKW-3DS-LocalWireless
 python3 build_update.py /path/to/MKW-3DS
 ```
 

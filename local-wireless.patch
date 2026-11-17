@@ -1,0 +1,2460 @@
+diff --git a/docs/MANUAL-PROGRAM-SOURCES.txt b/docs/MANUAL-PROGRAM-SOURCES.txt
+index 7fdb4b9..13e24cc 100644
+--- a/docs/MANUAL-PROGRAM-SOURCES.txt
++++ b/docs/MANUAL-PROGRAM-SOURCES.txt
+@@ -224,6 +224,7 @@ src/linear_lock.cpp
+ src/loading_screen.cpp
+ src/luma_visual.cpp
+ src/main.cpp
++src/netplay.cpp
+ src/menu_focus.cpp
+ src/menu_index.cpp
+ src/menu_models.cpp
+diff --git a/include/mkw/menu_ui.hpp b/include/mkw/menu_ui.hpp
+index 3d2b967..ec4b257 100755
+--- a/include/mkw/menu_ui.hpp
++++ b/include/mkw/menu_ui.hpp
+@@ -13,6 +13,11 @@ namespace mkw {
+ enum class UiPage {Title,MainMenu,Mode,Character,Vehicle,Drift,Cup,Course,Confirm,Race,Pause,QuitConfirm,Results,Error,Strap,License,EngineClass,VSMode,BattleMode,BattleCup,BattleStage,Ghost,Intro,DriftHelp,VSRules,TeamConfirm,Settings,LicenseSettings,EraseLicense,RecordsGeneral,RecordsFavorites,RecordsOther,Unlock,BattleRules};
+ enum class UiAction {None,StartRace,RestartRace,ResumeRace,Exit};
+ enum class UiMode {GrandPrix,TimeTrials,VS,Battle};
++// The Local Wireless page's help bar (set by the game every frame).
++extern const char* uiWirelessStatus;
++extern const char* uiWirelessGlyphs;
++// The Local Wireless page's two button labels (set by the game; null: Host / Join).
++extern const char* uiWirelessLabels[2];
+ enum class UiEngineClass {CC50,CC100,CC150,Mirror};
+ struct UiMainMenuControl {unsigned group;float x,y;};
+ // Seven source child controls in four frames. Centers combine the original
+@@ -91,6 +96,10 @@ public:
+  bool mixedTypesUnlocked(unsigned cc)const{return cc>=2||(cc<2&&licenseCompleted(unlocks(),30+cc));}
+  int editLicenseRequest=-1;
+  unsigned auxiliaryReturnCursor=0;UiPage rulesReturn=UiPage::VSMode;
++ // Local wireless: the VS page reused as the Local Wireless page (main menu > Multiplayer);
++ // a choice there (0 host, 1 join, 2 leave) is left in wirelessRequest for the game.
++ bool wireless=false;int wirelessRequest=-1;
++ bool netGuest=false; // connected local wireless guest: the host picks the course
+  UiSelection rulesEntry{};
+  std::array<unsigned,32> vsCourseDeck{};unsigned vsCourseIndex=0;
+  std::array<unsigned,10> battleStageDeck{};unsigned battleStageIndex=0;
+diff --git a/include/mkw/netplay.hpp b/include/mkw/netplay.hpp
+new file mode 100644
+index 0000000..d2dddaf
+--- /dev/null
++++ b/include/mkw/netplay.hpp
+@@ -0,0 +1,87 @@
++#pragma once
++// Local wireless (UDS: console to console, no access point) VS races, 2 to 12 racers.
++// Star layout: guests talk only to the host; the host bundles every kart into one packet.
++// Every racer has a race ID (its grid position), the same on every console. Each console
++// simulates its own kart as racer index 0; the host also drives the CPUs. Other racers are
++// driven by their received inputs and pulled toward their received state.
++#include <cstdint>
++
++namespace Kinoko::Kart { class KartObject; }
++
++namespace mkw::net {
++enum class Role : uint8_t { None, Host, Guest };
++Role role();
++bool connected();
++// At start-up, with L or R held: text lobby on the lower screen (host / join).
++// Call before the renderer starts; it restores the lower LCD format it changes.
++void bootLobby();
++// Pump received packets and keep-alives. Cheap; call every frame anywhere.
++void poll();
++void shutdown();
++// The Local Wireless menu page (main menu > Multiplayer). These return at once; joining
++// keeps searching for a host in the background.
++void hostBegin();
++void joinBegin();
++// One short line for the page's help bar: what the link is doing.
++const char* statusText();
++
++struct StartInfo { uint8_t course = 0, engineClass = 2; bool mirror = false; uint8_t items = 0; };
++// Host: offer a VS race to every guest, collect answers and send the roster: the host,
++// the guests who accepted, then `cpuCount` CPUs. True when at least one guest joined.
++bool hostStartRace(const StartInfo& info, uint16_t hostGarage, const uint16_t* cpuGarages, unsigned cpuCount);
++// Guest: a race the host offered, not yet answered.
++bool guestStartPending(StartInfo& out);
++// Guest: answer the offer. Accepting waits for the roster: true when in the race.
++bool guestAnswer(bool accept, uint16_t garage);
++// Guest: accept now (on the results screen), join the race once the screen is left.
++void guestAcceptEarly(uint16_t garage);
++
++bool inRace();
++// This console's player name (the license's, UTF-16, up to 10 units), sent with its answers.
++void setLocalName(const uint16_t* name);
++// A racer's player name (nullptr for CPUs and outside a shared race).
++const uint16_t* nameFor(unsigned index);
++// The host stopped answering during a race: every other kart is now driven here.
++bool hostLost();
++// The shared race's racers: index 0 is this console, 1..count-1 the others.
++unsigned raceCount();
++uint16_t garageFor(unsigned index);
++uint8_t startPositionFor(unsigned index); // one-based grid slot, the same on every console
++uint16_t externalMask();                  // racers driven from the network here
++bool ownsRacer(unsigned index);           // this console decides that racer's items and hits
++// While a loaded race holds before its intro: true once every console has loaded.
++bool raceReady();
++// Before each simulation step: every remote racer's inputs and state correction.
++void applyRemotes();
++// After each simulation step: this console's racer (and, on the host, its CPUs).
++void sendLocal(Kinoko::Kart::KartObject* kart, unsigned buttons, unsigned stickRaw, unsigned trick, bool finished);
++void endRace();
++// The host left its results: on a guest still racing, the race ends now.
++void hostRaceOver();
++bool takeRaceOver();
++// Lobby: the host sends every console to character selection (VS); guests take it once.
++void hostLobbyGo();
++bool takeLobbyGo();
++
++// Items. The console that owns a racer decides its item boxes and the hits it takes and
++// tells the others; item buttons travel with the kart state.
++struct ItemNews {
++    enum Kind : uint8_t { Got = 1, Hit = 2, Throw = 3 } kind = Got;
++    uint8_t racer = 0;             // racer index on this console
++    uint8_t item = 20;             // ItemKind
++    uint8_t owner = 12;            // Hit: the attacker's racer index; Throw: the target (12: none)
++    int8_t action = -1;            // Hit: the kart action; Throw: 1 when thrown backwards
++    float direction[3]{}, position[3]{}; // Throw: velocity and position
++    float flight[3]{}, speed = 0;  // Throw: flight direction and travel speed
++};
++bool popItemNews(ItemNews& out);
++void sendItemGot(unsigned racer, uint8_t item);
++void sendHit(unsigned racer, int8_t action, unsigned ownerIndex, uint8_t item, const float direction[3], const float position[3]);
++void sendThrow(unsigned racer, uint8_t item, const float position[3], const float velocity[3], const float flight[3], float speed, unsigned targetIndex, bool backwards);
++// This tick's item buttons for a racer this console owns (sent with its next update),
++// and a remote racer's latest.
++void setItemInput(unsigned racer, bool use, bool backwards, bool forwards);
++void remoteItemInput(unsigned index, bool& use, bool& backwards, bool& forwards);
++// One short line of link statistics for the debug overlay (empty when not connected).
++void debugLine(char* out, unsigned size);
++}
+diff --git a/include/mkw/race_grid.hpp b/include/mkw/race_grid.hpp
+index fd3cd06..e3fe5ec 100755
+--- a/include/mkw/race_grid.hpp
++++ b/include/mkw/race_grid.hpp
+@@ -63,6 +63,8 @@ public:
+     static float steeringTo(Vec3 forward,Vec3 offset);
+     // QA autopilot: player zero follows the CPU route like the other racers.
+     bool driveLocal=false;
++    // Local wireless: racers whose inputs come from another console (no CPU AI).
++    uint16_t externalMask=0;
+     CpuAi& ai(){return ai_;}
+ private:
+     void forwardBumps();
+diff --git a/include/mkw/race_hud.hpp b/include/mkw/race_hud.hpp
+index 44ce35f..6c27470 100644
+--- a/include/mkw/race_hud.hpp
++++ b/include/mkw/race_hud.hpp
+@@ -4,6 +4,8 @@
+ #include <mkw/math.hpp>
+ #include <mkw/race_hud_layout.hpp>
+ namespace mkw {
++// Frame timing averages shown under the link line while the speedometer is on (SELECT).
++extern char raceHudPerfLine[320];
+ class Renderer;
+ class RaceItems;
+ struct CountdownCue {int digit=0;bool go=false;float scale=1,alpha=1;unsigned frame=0;};
+diff --git a/include/mkw/race_items.hpp b/include/mkw/race_items.hpp
+index 76291fb..7d864a3 100755
+--- a/include/mkw/race_items.hpp
++++ b/include/mkw/race_items.hpp
+@@ -91,6 +91,7 @@ struct ItemActor {
+     uint8_t bounceLimit=10;
+     bool active=false, explosion=false,backwards=false;
+     bool settled=false, scattered=false;
++    bool netFixed=false; // local wireless: its path was taken from the thrower's console
+     int16_t fuse=300;
+     uint16_t hitMask=0;
+     // RMCU ObjItem +0x78 bit 0x20000: the thrower is immune until the item is older than
+@@ -232,7 +233,24 @@ public:
+     /// victim, whose state at the bump is `target`.
+     void cloudBump(unsigned attacker,unsigned victim,const ItemRacer& target);
+     static bool segmentHits(Vec3 from,Vec3 to,Vec3 center,float radius);
++    // Local wireless: racers simulated on another console. Their own console decides their
++    // item boxes and the hits they take, so here they break boxes without a roulette, pass
++    // through items, and take strikes only through netStrike.
++    uint16_t remoteMask=0;
++    // The item a remote racer's roulette gave (their console decided it).
++    void netGive(unsigned player,ItemKind kind);
++    // A hit a remote racer's console reported: remove the item that hit it (the nearest of
++    // that kind to where it happened), then play the strike.
++    void netStrike(unsigned player,int action,unsigned owner,Vec3 direction,ItemKind item,Vec3 position);
++    // An item a remote racer threw, as it left their kart: this console's copy (fired by the
++    // same button press) takes that exact path. Kept a moment if the copy does not exist yet.
++    void netThrow(unsigned player,ItemKind kind,Vec3 position,Vec3 velocity,Vec3 flight,float speed,int target,bool backwards);
++    void netTick();
+ private:
++    struct NetThrow{bool used=false;unsigned player=0;ItemKind kind=ItemKind::None;Vec3 position{},velocity{},flight{};float speed=0;int target=-1;bool backwards=false;uint8_t ttl=0;};
++    std::array<NetThrow,8> netThrows_{};
++    bool applyNetThrow(const NetThrow& t);
++    bool netStrike_=false;
+     ItemOdds odds_;
+     WoodboxOdds woodboxOdds_;
+     ShellRoute shellRoute_;
+diff --git a/include/mkw/render_quality.hpp b/include/mkw/render_quality.hpp
+index 5defd69..2b67283 100644
+--- a/include/mkw/render_quality.hpp
++++ b/include/mkw/render_quality.hpp
+@@ -31,6 +31,9 @@ struct RenderQuality {
+     // effects to the 3 nearest karts within 3,000 units, 2 to the 2 nearest
+     // within 2,000 (retail's two-player split screen).
+     unsigned kartEffectScreens=1;
++    // Opponent detail stages switch at this fraction of the retail camera distances
++    // (1: full animated racers to 1750 units; lite 0.6: to 1050).
++    float racerLodDistance=1.f;
+     // CPU-skinned spectator crowds and animated item models (Bullet Bill,
+     // Thundercloud, POW...) advance in steps of this many ticks (4: 15 Hz),
+     // so their skinned pose repeats on alternate frames; 0 every tick.
+diff --git a/include/mkw/renderer.hpp b/include/mkw/renderer.hpp
+index 566a7c2..bccf8c9 100755
+--- a/include/mkw/renderer.hpp
++++ b/include/mkw/renderer.hpp
+@@ -95,6 +95,15 @@ public:
+     float* skinBoneIndices=nullptr;
+     uint16_t* indices=nullptr;
+     uint32_t vertexCount=0,indexCount=0;
++    // Immutable geometry the GPU reads from VRAM (moveGeometryToVram); the
++    // LINEAR copies above stay for CPU readers (shadow support, intro camera).
++    Vertex* gpuVertices=nullptr;
++    uint16_t* gpuIndices=nullptr;
++    const Vertex* drawVertices(const Vertex* v) const {return v==vertices&&gpuVertices?gpuVertices:v;}
++    const uint16_t* drawIndices() const {return gpuIndices?gpuIndices:indices;}
++    // Static models only (never animated/skinned): copies vertices and indices
++    // into VRAM when at least reserve bytes would remain. Bytes moved, or 0.
++    std::size_t moveGeometryToVram(std::size_t reserve);
+     std::vector<Submesh> submeshes;
+     std::vector<std::array<MaterialSampler,3>> samplers;
+     std::vector<std::shared_ptr<Texture>> textures;
+@@ -433,6 +442,17 @@ public:
+     template<class T> void retire(std::shared_ptr<T> object){if(object)retireShared(std::shared_ptr<void>(std::move(object)));}
+     // The last drawn frame's counts (a deferred frame's arrive one frame later).
+     uint32_t triangles=0,drawCalls=0;
++    // Draw calls per frame section (diagnostics): endCategory(k) closes section k.
++    std::array<uint16_t,16> categoryDraws{};
++    std::array<float,16> gpuCategoryMs{}; // diagnostics (gpuProfile): GPU ms per draw category, previous frame
++    bool debugTinyScissor=false; // diagnostics: world draws clipped to 8x8 pixels (vertex-only cost)
++    bool gpuProfile=false; // serialize the GPU at category ends and time each part (slow; diagnostics only)
++    bool debugSkipEffects=false; // diagnostics: hide particle effects
++    bool shadowScissor=true; // limit the player shadow receiver pass to its screen footprint
++    bool fineShadowReceivers=true; // player shadow body pass over fine receiver blocks
++    bool earlyGpuStart=true; // run the GPU queue at category boundaries instead of only at frame end
++    bool contactShadows=false; // per-wheel contact darkening under the player (4 extra receiver passes x2)
++    void endCategory(unsigned k);
+     uint32_t culledTriangles=0,culledSubmeshes=0;
+     float previousGpuMs=0,beginWaitMs=0,commandUsage=0;
+     // Render thread time for the last drawn frame (excluding its FrameBegin
+@@ -449,7 +469,11 @@ public:
+ private:
+     // Recording (src/render_thread.cpp).
+     struct FrameList;
+-    struct Stats {uint32_t triangles=0,drawCalls=0,culledTriangles=0,culledSubmeshes=0;float previousGpuMs=0,beginWaitMs=0,commandUsage=0,renderMs=0;RenderMetrics metrics{};};
++    struct Stats {uint32_t triangles=0,drawCalls=0,culledTriangles=0,culledSubmeshes=0;float previousGpuMs=0,beginWaitMs=0,commandUsage=0,renderMs=0;RenderMetrics metrics{};std::array<uint16_t,16> categories{};uint32_t categoryMark=0;std::array<float,16> gpuCategoryMs{};uint64_t gpuMark=0;};
++    void endCategoryNow(unsigned k);
++    void kickGpu();
++    static constexpr unsigned KickEvery=24; // draws between early GPU starts
++    unsigned lastKick_=0;
+     bool recording() const;
+     // The 3D slider's position (0..1), or its QA override.
+     float slider() const;
+diff --git a/include/mkw/runtime_profile.hpp b/include/mkw/runtime_profile.hpp
+index 24109ae..f841f25 100755
+--- a/include/mkw/runtime_profile.hpp
++++ b/include/mkw/runtime_profile.hpp
+@@ -4,6 +4,7 @@
+ #include <array>
+ #include <mkw/animation_budget.hpp>
+ #include <cstdio>
++#include <algorithm>
+ namespace mkw {
+ // Optional physical-device/emulator evidence. Marker is on writable SD even
+ // for ROMFS builds; package allowlists never install it. Batched I/O keeps
+@@ -19,6 +20,8 @@ public:
+  void mark(Stage){}
+  void end(unsigned,const Renderer&,bool=true){}
+  void finish(){}
++ void setLive(bool){}
++ void liveText(char* out,unsigned n)const{if(n)out[0]=0;}
+ #else
+  RuntimeProfile(){
+ #ifndef MKW_FRAME_CAPTURE
+@@ -32,6 +35,15 @@ public:
+ #endif
+  }
+  ~RuntimeProfile(){finish();}
++ // Live averages for the on-screen overlay (SELECT in a race), without a file.
++ void setLive(bool live){live_=live;}
++ void liveText(char* out,unsigned n)const{
++  if(!n)return;out[0]=0;if(!live_||avgInterval_<=0)return;
++  const auto& a=avg_;
++  // FPS, worst frame and slow frames (over 20 ms) in the last second, render thread, GPU, then CPU stages.
++  std::snprintf(out,n,"%.0fF MAX%.0f SL%u R%.1f G%.1f D%.0f T%.0fK S%.1f C%.1f O%.1f X%.1f",
++   1000.f/avgInterval_,shownWorst_,shownSlow_,avgRender_,avgGpu_,avgDraws_,avgTris_/1000.f,a[Simulation],a[Course]+a[Scenery],a[Opponents]+a[Items]+a[Player],a[Effects]);
++ }
+  void begin(unsigned course,unsigned frame,unsigned ticks,float interval){
+   if(!on())return;
+   row_={};row_.course=course;row_.frame=frame;startTicks_=ticks;row_.interval=interval;
+@@ -50,6 +62,23 @@ public:
+   row_.command=renderer.commandUsage;
+   row_.renderThread=renderer.renderThreadMs;row_.renderWait=renderer.beginWaitMs;row_.recordWait=renderer.recordWaitMs;
+   }
++  if(live_&&rendered){
++   // Frames actually drawn: the time since the previous drawn frame (a frame the
++   // renderer could not take is skipped and is not a frame on screen).
++   const uint64_t nowTick=svcGetSystemTick();
++   row_.interval=lastRendered_?float((nowTick-lastRendered_)*1000.0/SYSCLOCK_ARM11):row_.interval;lastRendered_=nowTick;
++   constexpr float k=.05f;
++   for(unsigned i=0;i<StageCount;++i)avg_[i]+=(row_.ms[i]-avg_[i])*k;
++   avgGpu_+=(row_.gpu-avgGpu_)*k;avgRender_+=(row_.renderThread-avgRender_)*k;avgDraws_+=(float(row_.draws)-avgDraws_)*k;avgTris_+=(float(row_.triangles)-avgTris_)*k;
++   if(row_.interval>0&&row_.interval<500){worst_=std::max(worst_,row_.interval);slow_+=row_.interval>20.f;}
++   if(++window_>=60){shownWorst_=worst_;shownSlow_=slow_;worst_=0;slow_=0;window_=0;}
++   if(row_.interval>0&&row_.interval<200)avgInterval_=avgInterval_>0?avgInterval_+(row_.interval-avgInterval_)*k:row_.interval;
++  }
++  if(!file_
++#ifdef MKW_FRAME_CAPTURE
++     &&!collecting_
++#endif
++    )return;
+   rows_[count_++]=row_;if(count_==rows_.size()){
+ #ifdef MKW_FRAME_CAPTURE
+    collecting_=false; // Save only on pause/exit, outside the measured race.
+@@ -83,11 +112,12 @@ private:
+  // sample; disk writes occur only on completion/pause, not every120 frames.
+  bool on()const{
+ #ifdef MKW_FRAME_CAPTURE
+-  return collecting_;
++  return collecting_||live_;
+ #else
+-  return file_!=nullptr;
++  return file_!=nullptr||live_;
+ #endif
+  }
++ bool live_=false;std::array<float,StageCount> avg_{};float avgGpu_=0,avgInterval_=0,avgRender_=0,avgDraws_=0,avgTris_=0,worst_=0,shownWorst_=0;unsigned slow_=0,shownSlow_=0,window_=0;uint64_t lastRendered_=0;
+ #ifdef MKW_FRAME_CAPTURE
+  bool collecting_=false;
+ #endif
+diff --git a/src/item_world.cpp b/src/item_world.cpp
+index ca7321a..1f3b042 100644
+--- a/src/item_world.cpp
++++ b/src/item_world.cpp
+@@ -513,7 +513,8 @@ void RaceItems::boxContacts(unsigned player){
+         box.active=false;box.respawn=ItemBoxRespawn;
+         sound(ItemSoundCue::BoxBreak,player,ItemKind::None,box.position);
+         const auto& h=hud_[player];
+-        if(h.item==ItemKind::None&&!h.roulette&&!h.bullet&&!r.controlLocked)startRoulette(player);
++        // A remote racer's roulette is decided on its own console (RaceItems::netGive).
++        if(h.item==ItemKind::None&&!h.roulette&&!h.bullet&&!r.controlLocked&&!(remoteMask&(1u<<player)))startRoulette(player);
+     }
+ }
+ void RaceItems::kartContacts(unsigned player){
+@@ -521,6 +522,7 @@ void RaceItems::kartContacts(unsigned player){
+     const auto& r=racers_[player];
+     boxContacts(player);
+     if(r.finished)return;
++    if(remoteMask&(1u<<player))return; // items meet remote racers on their own consoles
+     // Actor pool order stands in for the retail entity search order.
+     for(auto& a:actors_)if(a.active&&itemTouchesKart(a,player))actorKartContact(a,player);
+     heldKartContacts(player);
+diff --git a/src/lakitu.cpp b/src/lakitu.cpp
+index 4a81834..0ac92ad 100755
+--- a/src/lakitu.cpp
++++ b/src/lakitu.cpp
+@@ -400,7 +400,9 @@ void Lakitu::drawShadow(Renderer& renderer,const Model* const* receivers,unsigne
+     Mtx_Translate(&pose,at.x,kartY+100.f-30.f*bindY*inverseBind,at.z,false);
+     Mtx_Scale(&pose,size*inverseBind,30.f*inverseBind,size*inverseBind);
+     const Renderer::ShadowVolume fallback{m.shadow.get(),pose};
+-    if(dynamic&&renderer.playerShadowReady())
++    // Lakitu's projected shadow was a second full shadow capture plus a 2400-unit
++    // receiver pass (a visible frame drop at every lap); retail draws a volume.
++    if(false&&dynamic&&renderer.playerShadowReady())
+         renderer.drawPlayerShadow(m.shadowCasters.data(),unsigned(m.shadowCasters.size()),receivers,receiverCount,at,light,1.f,
+                                   m.shadow?&fallback:nullptr,objects,objectCount,true);
+     else if(m.shadow)renderer.drawShadowVolumes(&fallback,1,.5f);
+diff --git a/src/main.cpp b/src/main.cpp
+index eebecbb..d9a5311 100755
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -28,6 +28,8 @@
+ #include <mkw/driver_controller.hpp>
+ #include <mkw/driver_effect_anchor.hpp>
+ #include <mkw/roster.hpp>
++#include <mkw/netplay.hpp>
++#include <mkw/menu_focus.hpp>
+ #include <mkw/garage.hpp>
+ #include <mkw/vehicle_animation.hpp>
+ #include <mkw/luma_visual.hpp>
+@@ -218,6 +220,9 @@ static unsigned selectedGarageIndex(){return driverChoice<24?driverChoice*mkw::V
+ static const auto& selectedVehicle(){return mkw::raceGarageChoice(selectedGarageIndex());}
+ static mkw::CpuRoster selectedRoster;
+ static std::array<uint8_t,12> selectedStartPositions{};
++// Local wireless: this race is shared with the other console (mkw::net).
++namespace mkw{unsigned vramGeometryKb=0,vramGeometryModels=0,vramGeometryTotal=0,vramTexturesMoved=0,vramFreeKb=0;}
++static bool netRace=false;
+ static void configure(K::System::RaceConfig* config,void* context) {
+     if(replayData){config->setGhost(replayData);config->raceScenario().players[0].type=K::System::RaceConfig::Player::Type::Ghost;return;}
+     auto& s=config->raceScenario();s.course=Courses[courseChoice].id;
+@@ -225,7 +230,14 @@ static void configure(K::System::RaceConfig* config,void* context) {
+     s.cpuDifficulty=uint8_t(selectedCpu);s.cpuVehicles=uint8_t(selectedCpuVehicles);s.itemMode=uint8_t(selectedItems);
+     s.gameMode=static_cast<K::System::RaceConfig::Scenario::GameMode>(selectedRaceMode);
+     s.teams=selectedTeams;s.humanTeam=uint8_t(selectedHumanTeam);s.battleType=coinRunnersMode?1:0;
+-    if(fullRace){static_cast<mkw::RaceGrid*>(context)->configure(*config,selectedGarageIndex(),timeTrial?1:12,selectedRoster.ready?&selectedRoster.choices:nullptr);for(unsigned i=0;i<s.playerCount;++i)s.players[i].startPosition=selectedStartPositions[i];s.players[0].driftIsAuto=automaticDrift;return;}
++    if(fullRace){
++        const std::array<unsigned,12>* roster=selectedRoster.ready?&selectedRoster.choices:nullptr;
++        static std::array<unsigned,12> netRoster;
++        // Netplay: two racers, the other console's choice as racer 1; the host starts in front.
++        if(netRace){netRoster={};for(unsigned i=1;i<mkw::net::raceCount();++i)netRoster[i]=mkw::net::garageFor(i);roster=&netRoster;}
++        static_cast<mkw::RaceGrid*>(context)->configure(*config,selectedGarageIndex(),timeTrial?1:netRace?mkw::net::raceCount():12,roster);
++        for(unsigned i=0;i<s.playerCount;++i)s.players[i].startPosition=netRace?mkw::net::startPositionFor(i):selectedStartPositions[i];
++        s.players[0].driftIsAuto=automaticDrift;return;}
+     auto& p=s.players[0];p.type=K::System::RaceConfig::Player::Type::Local;
+     const auto& driver=selectedVehicle();
+     p.character=static_cast<K::Character>(driver.character);p.vehicle=static_cast<K::Vehicle>(driver.vehicle);p.driftIsAuto=false;
+@@ -425,6 +437,8 @@ int main() {
+     if(kQa)setenv("KINOKO_FILESYSTEM_ROOT",assetRoot,1);
+     bool qaMode=false;if(kQa)for(const char* test:{"trace","smoke","controls","replay","effects","animation","roster","garage","garage_controls","menu","objects"}){char marker[64];snprintf(marker,sizeof marker,"sdmc:/3ds/mkw-3ds/%s-test.txt",test);qaMode|=exists(marker);}
+     fullRace=!qaMode;
++    // Hold L or R while the game starts: local wireless lobby (prototype).
++    if(fullRace)mkw::net::bootLobby();
+     GyroTrickDevice gyroTrick;
+     // consoleInit changes the bottom LCD to RGB565 and disables double buffering.
+     // The normal dual-screen renderer transfers RGB8 frames, so only QA modes
+@@ -702,6 +716,13 @@ int main() {
+         menu.enter(mkw::UiPage::Unlock);
+         return true;
+     };
++    mkw::net::StartInfo guestOffer{};bool guestOfferPending=false,netGo=false,netFollow=false;
++    bool netCpus=true; // host setting (Local Wireless page): CPUs fill the grid
++    bool netLobbyGo=false;
++    bool bottomEveryFrame=false; // true: lower screen redrawn every frame (60 Hz)
++    unsigned perfHide=0; // diagnostics: 1 course 2 scenery 3 opponents 4 effects 5 sky 6 shadows 7 bottom 8 hud 9 all
++    auto perfHit=[&](unsigned k){return perfHide==k||perfHide==9;};
++    unsigned netClass=2; // host setting: 0 50cc, 1 100cc, 2 150cc, 3 Mirror (150cc mirrored)
+     auto runMenu=[&](){
+         mkw::animationStride.store(1);
+         notificationLed.clear();
+@@ -793,6 +814,32 @@ int main() {
+             return result;
+         };
+         while(aptMainLoop()){
++            if(mkw::net::role()!=mkw::net::Role::None&&menu.page!=mkw::UiPage::Pause&&menu.page!=mkw::UiPage::QuitConfirm){
++                // Back in the menus: any shared race is over.
++                if(mkw::net::inRace())mkw::net::endRace();
++                netRace=false;
++                mkw::net::StartInfo offer;
++                if(mkw::net::guestStartPending(offer)){
++                    using P=mkw::UiPage;const P page=menu.page;
++                    const bool idle=page==P::MainMenu||page==P::Mode||page==P::Character||page==P::Vehicle||page==P::Drift||
++                        page==P::Cup||page==P::Course||page==P::Confirm||page==P::EngineClass||page==P::VSMode||page==P::VSRules||page==P::DriftHelp;
++                    if(idle&&!transition.active()){
++                        guestOffer=offer;guestOfferPending=true;menu.selection.mode=mkw::UiMode::VS;menu.wireless=false;
++                        menuSound.leave();return leave(mkw::UiAction::StartRace);
++                    }
++                    mkw::net::guestAnswer(false,0);
++                }
++                mkw::net::poll();
++                if(mkw::net::takeLobbyGo())netLobbyGo=true;
++            }
++            // Local wireless lobby START: straight to character selection in VS (solo).
++            if(netLobbyGo&&!transition.active()){
++                netLobbyGo=false;using P=mkw::UiPage;
++                if(menu.page==P::VSMode||menu.page==P::MainMenu||menu.page==P::Mode){
++                    menu.wireless=false;menu.selection.mode=mkw::UiMode::VS;menu.selection.teams=false;
++                    menu.enter(P::Character); // opens on the license's saved driver
++                }
++            }
+             if(selectionSave&&selectionSave->done()){
+                 menu.saveFailed=!selectionSave->ok;
+                 if(selectionSave->ok)licenseSaves[selectionSave->slot]=selectionSave->value;
+@@ -821,7 +868,29 @@ int main() {
+             const auto beforeInput=menu;
+             if(selectionSave||pendingRaceMiiConfirm)input={};
+             const bool acceptedInput=!transition.active()&&!selectionSave&&!pendingRaceMiiConfirm;
++            {   // The Local Wireless page: its labels follow this console's role.
++                static char labels[2][24];using R=mkw::net::Role;const auto role=mkw::net::role();
++                if(role==R::Host){
++                    std::snprintf(labels[0],sizeof labels[0],"CPUs: %s",netCpus?"On":"Off");
++                    static const char* classes[]={"50cc","100cc","150cc","Mirror"};
++                    std::snprintf(labels[1],sizeof labels[1],"%s",classes[netClass&3]);
++                    mkw::uiWirelessLabels[0]=labels[0];mkw::uiWirelessLabels[1]=labels[1];
++                }else if(role==R::Guest&&mkw::net::connected()){
++                    unsigned player=2;std::sscanf(mkw::net::statusText(),"Joined as player %u",&player);
++                    std::snprintf(labels[0],sizeof labels[0],"Player %u",player);
++                    mkw::uiWirelessLabels[0]=labels[0];mkw::uiWirelessLabels[1]="Waiting for host";
++                }else mkw::uiWirelessLabels[0]=mkw::uiWirelessLabels[1]=nullptr;
++            }
++            mkw::uiWirelessStatus=mkw::net::statusText();
++            menu.netGuest=mkw::net::role()==mkw::net::Role::Guest&&mkw::net::connected();
+             auto action=transition.input(menu,input);
++            if(menu.wirelessRequest>=0){
++                const int request=menu.wirelessRequest;menu.wirelessRequest=-1;using R=mkw::net::Role;
++                if(request==3){if(mkw::net::role()==R::Host&&mkw::net::connected()){mkw::net::hostLobbyGo();netLobbyGo=true;}}
++                else if(request==2)mkw::net::shutdown();
++                else if(mkw::net::role()==R::Host){if(request==0)netCpus=!netCpus;else if(request==1)netClass=(netClass+1)%4;} // host settings
++                else if(mkw::net::role()==R::None){if(request==0)mkw::net::hostBegin();else mkw::net::joinBegin();}
++            }
+             if(acceptedInput&&menu.selectRaceMiiRequest>=24){
+                 mkw::LicenseIdentity identity;mkw::MiiAppearance appearance;mkw::MiiBodySpec body;
+                 const unsigned outfit=unsigned(menu.selectRaceMiiRequest-24);
+@@ -1204,7 +1273,28 @@ int main() {
+         selectedMirror=cc==3;selectedEngineClass=std::min(cc,2u);
+         selectedCpu=battleMode?menu.selection.battleCpu:vs?menu.selection.vsCpu:(selectedRaceMode==0?std::min(selectedEngineClass,2u):1u);selectedCpuVehicles=battleMode?menu.selection.battleVehicles:vs?menu.selection.vsVehicles:0;selectedItems=battleMode?menu.selection.battleItems:vs?menu.selection.vsItems:0;
+     };
+-    if(fullRace){if(runMenu()!=mkw::UiAction::StartRace){finishAutoplay();renderer.waitForGpu();menuModels.reset(renderer);menuIcons.reset(renderer);menuRenderer.release();mkw::SoundSystem::instance().stop();mkw::MenuMovieAudio::shutdown();mkw::shutdownLoadingScreen();renderer.shutdown();gfxExit();return 0;}applySelection();menu.raceStarted();raceLoadStart=svcGetSystemTick();}
++    // After applySelection: share the race with the other console when connected.
++    auto prepareNetRace=[&](bool restart){
++        netRace=false;netGo=false;netFollow=false;mkw::net::endRace();
++        mkw::net::setLocalName(licenseSaves[activeLicense].name.data());
++        if(guestOfferPending){
++            guestOfferPending=false;
++            courseChoice=guestOffer.course;selectedEngineClass=guestOffer.engineClass;selectedMirror=guestOffer.mirror;
++            battleMode=coinRunnersMode=timeTrial=false;selectedRaceMode=1;selectedItems=guestOffer.items;selectedTeams=false;
++            netRace=mkw::net::guestAnswer(true,uint16_t(selectedGarageIndex()));return; // not listed: an ordinary race
++        }
++        if(restart||mkw::net::role()!=mkw::net::Role::Host||battleMode||timeTrial||selectedRaceMode!=1)return;
++        selectedMirror=netClass==3;selectedEngineClass=std::min(netClass,2u); // the lobby's class
++        mkw::net::StartInfo info{uint8_t(courseChoice),uint8_t(selectedEngineClass),selectedMirror,uint8_t(selectedItems)};
++        // CPUs fill the grid to twelve: the host drives them for everyone.
++        std::array<uint16_t,11> cpus{};
++        for(unsigned k=0;k<cpus.size();++k)cpus[k]=uint16_t(selectedRoster.ready?selectedRoster.choices[k+1]:
++            mkw::offlineRaceDriver(driverChoice<24?driverChoice:0,k+1)*mkw::VehiclesPerDriver+(k+1)%6);
++        if(!mkw::net::hostStartRace(info,uint16_t(selectedGarageIndex()),cpus.data(),netCpus?unsigned(cpus.size()):0u))return; // nobody joined: an ordinary race
++        selectedTeams=false; // prototype: solo races only
++        netRace=true;
++    };
++    if(fullRace){if(runMenu()!=mkw::UiAction::StartRace){finishAutoplay();renderer.waitForGpu();menuModels.reset(renderer);menuIcons.reset(renderer);menuRenderer.release();mkw::SoundSystem::instance().stop();mkw::MenuMovieAudio::shutdown();mkw::shutdownLoadingScreen();renderer.shutdown();gfxExit();return 0;}applySelection();prepareNetRace(false);menu.raceStarted();raceLoadStart=svcGetSystemTick();}
+     bool dataReady=exists("Race/Common.szs")&&courseAvailable(courseChoice);
+     if(dataReady&&(kQa&&exists("sdmc:/3ds/mkw-3ds/trace-test.txt"))) {
+         // Invoke upstream's complete per-frame KRKG comparison, not just final position.
+@@ -1278,7 +1368,8 @@ int main() {
+     };
+ 
+     mkw::GpTelemetry gpTelemetry;
+-    auto raceCount=[&](){return menu.selection.mode==mkw::UiMode::VS?menu.selection.vsRaces:4u;};
++    // A netplay guest follows the host's races: its own VS set never ends first.
++    auto raceCount=[&](){if(mkw::net::role()==mkw::net::Role::Guest&&mkw::net::connected())return 32u;return menu.selection.mode==mkw::UiMode::VS?menu.selection.vsRaces:4u;};
+     struct VsSet {unsigned race=0,driver=~0u;std::array<uint8_t,12> finishPositions{};std::array<uint16_t,12> points{},roundStartPoints{};std::array<mkw::GpRacePerformance,4> performance{};std::array<bool,4> performanceCaptured{};std::array<unsigned,4> performanceCourses{};bool next=false;};
+     auto vsSetStorage=std::make_unique<VsSet>();auto& vsSet=*vsSetStorage;bool nextRaceQueued=false;
+     mkw::BattleSession battleSession;battleSession.reset(menu.selection.battleWins);bool sessionCoin=coinRunnersMode;
+@@ -1696,7 +1787,10 @@ int main() {
+     // first, so the course's first bloom request (below) still finds its room.
+     auto loadBottomScreen=[&](){
+         const auto* bloom=mkw::courseBloom(Courses[courseChoice].archive);
+-        if(!effectsTest&&bloom&&bloom->enabled()&&!renderer.reserveBloom()){report("FAIL required bloom targets");return false;}
++        // Bloom is off in the default (lite) preset: its ~1 MB of VRAM targets now holds
++        // the course geometry. The FULL diagnostics position allocates them on demand.
++        (void)bloom;
++        if(false&&!effectsTest&&bloom&&bloom->enabled()&&!renderer.reserveBloom()){report("FAIL required bloom targets");return false;}
+         if(!effectsTest&&!renderer.configurePlayerShadow(menu.selection.dynamicShadows))report("WARN player shadow target unavailable; native volume retained");
+         if(!renderer.configureStadiumScreen(!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))){report("FAIL stadium screen targets");return false;}
+         if(!bottomScreen.load(renderer,courseChoice)){report("FAIL required bottom screen");return false;}
+@@ -1707,11 +1801,18 @@ int main() {
+     // Reduced quality: the course's textures move to VRAM once bloom and the
+     // bottom screen have theirs, which frees their LINEAR (render_quality.hpp).
+     auto moveCourseTexturesToVram=[&](){
+-        if(!mkw::renderQuality().vramCourseTextures)return;
+         renderer.waitForGpu();
+         const auto reserve=mkw::RenderQuality::vramReserve;unsigned moved=0;
++        // Course geometry first: the GPU re-reads every vertex every frame (and
++        // again for the player shadow's receivers); textures go through a cache.
++        {std::size_t geometry=0;unsigned models=0;
++         for(auto& model:track)if(false){const auto b=model->gpuVertices?std::size_t(model->vertexCount)*sizeof(mkw::Vertex)+model->indexCount*2u:model->moveGeometryToVram(reserve);if(b){geometry+=b;++models;}}
++         mkw::vramGeometryKb=unsigned(geometry/1024);mkw::vramGeometryModels=models;mkw::vramGeometryTotal=unsigned(track.size());
++         LOGF("course geometry in VRAM models=%u/%u bytes=%lu vram_free=%lu",models,unsigned(track.size()),(unsigned long)geometry,(unsigned long)vramSpaceFree());}
++        if(!mkw::renderQuality().vramCourseTextures)return;
+         for(auto* parts:{&track,&sky})for(auto& model:*parts)for(auto& t:model->textures)if(t)moved+=renderer.moveToVram(*t,reserve);
+         moved+=courseObjects.moveTexturesToVram(renderer,reserve);
++        mkw::vramTexturesMoved=moved;mkw::vramFreeKb=unsigned(vramSpaceFree()/1024);
+         LOGF("course textures in VRAM moved=%u linear_free=%lu vram_free=%lu",moved,(unsigned long)linearSpaceFree(),(unsigned long)vramSpaceFree());
+     };
+     // Course meshes and their spatial indices are loaded for a race and kept
+@@ -2107,7 +2208,7 @@ int main() {
+         if(raceWarmupFrames)held=down=0;
+         if(fullRace){
+             // A or START skips the course preview; that press does nothing else.
+-            if(intro.active()&&menu.page==mkw::UiPage::Race&&(down&(KEY_A|KEY_START))){endIntro();down&=~u32(KEY_A|KEY_START);}
++            if(!netRace&&intro.active()&&menu.page==mkw::UiPage::Race&&(down&(KEY_A|KEY_START))){endIntro();down&=~u32(KEY_A|KEY_START);}
+             if(results.active()){
+                 // Result boards take A/B/START (Leaderboard, USA 0x8083A5E0);
+                 // the end-of-race menu moves with the D-pad and confirms with A.
+@@ -2120,11 +2221,36 @@ int main() {
+                     else if(nav&(KEY_DDOWN|KEY_CPAD_DOWN))menu.input({false,true});
+                     results.setCursor(menu.cursor);
+                     if(menu.cursor!=oldCursor)mkw::SoundSystem::instance().play(mkw::snd::id::SE_UI_BTN_IN,0);
+-                    if(down&KEY_A)resultsInput.accept=true;
++                    // Netplay: only the host starts the next race; guests follow it (below),
++                    // finished or not. Quitting is always allowed.
++                    const bool netHold=netRace&&menu.cursor==0&&mkw::net::connected()&&mkw::net::role()==mkw::net::Role::Guest;
++                    if((down&KEY_A)&&!netHold)resultsInput.accept=true;
+                 }
+                 if(results.hudGone())down&=~u32(KEY_START);
+             }
+-            if(down&KEY_START)menu.input({false,false,false,false,false,false,true});
++            if(netRace&&mkw::net::role()==mkw::net::Role::Guest&&mkw::net::takeRaceOver()&&!raceGrid.finished()){
++                // The host ended the race: everyone still driving finishes in their current order.
++                std::array<uint8_t,12> order{};
++                for(unsigned i=0;i<raceGrid.count();++i){const unsigned rank=raceGrid.rank(i);if(rank>=1&&rank<=12)order[rank-1]=uint8_t(i);}
++                if(auto* race=K::System::RaceManager::Instance())race->endRemaining(order);
++            }
++            if(netRace&&mkw::net::role()==mkw::net::Role::Guest){
++                mkw::net::StartInfo offer;
++                if(mkw::net::guestStartPending(offer)){
++                    // The host started the next race: accept now, then leave the results.
++                    if(!guestOfferPending){guestOffer=offer;guestOfferPending=true;mkw::net::guestAcceptEarly(uint16_t(selectedGarageIndex()));}
++                    netFollow=true;
++                    if(!results.active()){
++                        // Still racing: this race ends here and the next one loads.
++                        raceSound.pause(true);netFollow=false;menu.enter(mkw::UiPage::MainMenu);nextRaceQueued=true;
++                    }
++                }
++                if(netFollow&&results.active()){
++                    if(endMenu){menu.cursor=0;results.setCursor(0);resultsInput.accept=true;}
++                    else resultsInput.advance=true;
++                }
++            }
++            if((down&KEY_START)&&!netRace)menu.input({false,false,false,false,false,false,true}); // netplay: no pause
+             // Mario Kart 7: a tap on the lower screen switches its map view.
+             if((down&KEY_TOUCH)&&menu.page==mkw::UiPage::Race&&!intro.active())bottomScreen.toggleView();
+             if(menu.page!=mkw::UiPage::Race&&menu.page!=mkw::UiPage::Results){
+@@ -2140,7 +2266,7 @@ int main() {
+                     raceGraphicsSuspended=false;
+                     raceLoadStart=svcGetSystemTick();
+                     renderer.waitForGpu();menuRenderer.release();
+-                    applySelection();startVsRace(action==mkw::UiAction::RestartRace);
++                    applySelection();prepareNetRace(action==mkw::UiAction::RestartRace);startVsRace(action==mkw::UiAction::RestartRace);
+                     // A different or previously failed course reloads completely;
+                     // restarting the same race keeps its scenery.
+                     const bool reloadTrack=trackCourse!=int(courseChoice);
+@@ -2169,6 +2295,33 @@ int main() {
+         // should the refresh count ever stall, the clock.
+         accumulator+=fullRace&&refreshes?double(std::min<u32>(refreshes,6)):std::min(delta,0.1)*60.0;
+         if(raceWarmupFrames)accumulator=1; // settle initial support, never catch up loading wall time
++        {   // 3D on: the top screen is drawn twice, so use the lighter per-frame detail
++            // settings of the reduced preset (none of its load-time ones) until 3D is off.
++            static int stereoLite=0;auto& q=mkw::renderQuality();
++            // The lighter per-frame preset is the default in both 2D and 3D (playtested: no
++            // visible difference, best frame rate); diagnostics position 12 restores full.
++            const bool want=fullRace&&!q.reduced&&perfHide!=12;
++            const int key=1+int(want)+2*int(perfHide==11);
++            if(key!=stereoLite){
++                stereoLite=key;const mkw::RenderQuality full{};
++                q.minScreenRatio=want?.015f:full.minScreenRatio;q.objectLowDistance=want?4000.f:full.objectLowDistance;
++                q.shadowVolumes=!want;q.bloomBlurRounds=want?1:full.bloomBlurRounds;q.boxSparkleRatio=want?.04f:full.boxSparkleRatio;
++                q.particleBudget=want?96u:full.particleBudget;q.kartEffectScreens=want?2u:full.kartEffectScreens;q.animationStep=want?4u:full.animationStep;
++                if(perfHide==11)q.shadowVolumes=false;
++                q.racerLodDistance=want?.6f:full.racerLodDistance;
++            }
++        }
++        profiler->setLive(fullRace&&raceHud.speedometer);profiler->liveText(mkw::raceHudPerfLine,sizeof mkw::raceHudPerfLine);
++        if(mkw::raceHudPerfLine[0]){const auto& c=renderer.categoryDraws;const size_t used=std::strlen(mkw::raceHudPerfLine);
++            static const char* hidden[]={"","-COURSE ","-SCENERY ","-OPPONENTS ","-EFFECTS ","-SKY ","-SHADOWS ","-BOTTOM ","-HUD ","-ALL ","-BLOOM ","-KARTSHADOW ","FULL ","DYNSHADOW "};
++            std::snprintf(mkw::raceHudPerfLine+used,sizeof mkw::raceHudPerfLine-used,"\n%s%s%s%sDRAWS C%u N%u O%u I%u P%u X%u H%u B%u",renderer.contactShadows?"+WHEEL ":"",renderer.fineShadowReceivers?"":"COARSESH ",renderer.gpuProfile?"PROFILE ":"",hidden[perfHide%14],
++                unsigned(c[Profile::Course]),unsigned(c[Profile::Scenery]),unsigned(c[Profile::Opponents]),unsigned(c[Profile::Items]),
++                unsigned(c[Profile::Player]),unsigned(c[Profile::Effects]),unsigned(c[Profile::Hud]),unsigned(c[Profile::Bottom]));
++            if(renderer.gpuProfile){const auto& g=renderer.gpuCategoryMs;
++                float sum=0;for(float v:g)sum+=v;
++                // Profile mode shows only this (the debug font has a small glyph budget).
++                std::snprintf(mkw::raceHudPerfLine,sizeof mkw::raceHudPerfLine,"GPU %s%s%sT%.1f GEO%u/%u %uK TEX%u FREE%uK\nSTART%.1f SKY%.1f C%.1f N%.1f O%.1f I%.1f P%.1f\nSHCAP%.1f SHREC%.1f S%.1f X%.1f H%.1f B%.1f",renderer.fineShadowReceivers?"":"COARSESH ",renderer.debugTinyScissor?"VERTONLY ":"",hidden[perfHide%14],sum,mkw::vramGeometryModels,mkw::vramGeometryTotal,mkw::vramGeometryKb,mkw::vramTexturesMoved,mkw::vramFreeKb,
++                    g[0],g[1],g[Profile::Course],g[Profile::Scenery],g[Profile::Opponents],g[Profile::Items],g[Profile::Player],g[12],g[13],g[14],g[Profile::Effects],g[Profile::Hud],g[Profile::Bottom]);}}
+         profiler->begin(unsigned(Courses[courseChoice].id),frames,physicsSteps,float(delta*1000));
+         if(dataReady){
+             if(trackLoadFailed){
+@@ -2185,6 +2338,17 @@ int main() {
+                 animationPass&=loadDriver();prepareGarageFixture();driftEffects.reset();raceEffects.reset();resetKartFx();accumulator=0;
+             }
+             if(fullRace&&(down&KEY_SELECT))raceHud.speedometer=!raceHud.speedometer;
++            // Diagnostics (dev builds, overlay on): the C-stick hides one draw category at a
++            // time, so the GPU time (G) it costs shows directly.
++            if(kQa&&fullRace&&raceHud.speedometer){
++                if(down&KEY_CSTICK_RIGHT)perfHide=(perfHide+1)%14;
++                if(down&KEY_CSTICK_LEFT)perfHide=(perfHide+13)%14;
++            }
++            renderer.debugSkipEffects=perfHide==4||perfHide==9;
++            // Diagnostics: -SHADOWS position doubles as A/B for wheel contact shadows (ZL toggles).
++            if(kQa&&fullRace&&raceHud.speedometer&&(down&KEY_ZL))renderer.debugTinyScissor=!renderer.debugTinyScissor;
++            if(kQa&&fullRace&&raceHud.speedometer&&(down&KEY_ZR))renderer.fineShadowReceivers=!renderer.fineShadowReceivers;
++            if(kQa&&fullRace&&raceHud.speedometer&&(down&KEY_X))renderer.gpuProfile=!renderer.gpuProfile;
+             if(qaMode&&((down&KEY_SELECT)||(!replay&&(down&(KEY_X|KEY_Y))))){
+                 renderer.waitForGpu();
+                 if(!replay&&(down&(KEY_X|KEY_Y))){
+@@ -2237,6 +2401,8 @@ int main() {
+             // QA race captures: lockstep, two source ticks per presented frame, so
+             // pacing-dependent presentation (name balloons) matches across builds.
+             else if(raceCapture)accumulator=2;
++            // Netplay: hold the loaded race (before its preview) until the other console has loaded too.
++            if(netRace&&fullRace&&!raceWarmupFrames&&!netGo){if(mkw::net::raceReady())netGo=true;else accumulator=0;}
+             while(accumulator>=1){auto tick=svcGetSystemTick();bool jumpAction=false;
+                 // Restore current human input every simulation tick before any
+                 // temporary autopilot override, including catch-up frame exits.
+@@ -2249,6 +2415,7 @@ int main() {
+                 }
+                 controller->setInputsRawStick(buttons,(selectedMirror?-stick:stick)+7,7,raceTrick);
+                 if(fullRace){
++                    raceGrid.externalMask=netRace?mkw::net::externalMask():0u;
+                     // After the goal retail hands the player to its AI
+                     // (AIEngine PostRaceDriving, USA 0x80728C28): the CPU
+                     // route driver steers and the item AI stays idle.
+@@ -2265,11 +2432,16 @@ int main() {
+                         // The CPU route threads between boxes: QA rolls the item roulette instead.
+                         if(physicsSteps%600==300&&qaGives.empty())raceItems->startRoulette(0);
+                     }
++                    // Netplay: remote racers' item buttons, and this console's for them.
++                    if(netRace)for(unsigned i=1;i<raceGrid.count();++i)if(!mkw::net::ownsRacer(i))mkw::net::remoteItemInput(i,inputs[i].use,inputs[i].backwards,inputs[i].forwards);
+                     // CPU items: retail AIItemRace commands from the previous AI tick.
+                     for(unsigned i=1;i<raceGrid.count();++i){
++                        if(netRace&&!mkw::net::ownsRacer(i))continue;
+                         if(!raceGrid.ai().ready()){inputs[i]=raceItems->autoItemInput(i);continue;}
+                         const auto& c=raceGrid.ai().itemCommand(i);inputs[i]={c.use,c.backwards,c.forwards};
+                     }
++                    // Item buttons of the racers this console drives, for the others.
++                    if(netRace)for(unsigned i=0;i<raceGrid.count();++i)if(mkw::net::ownsRacer(i))mkw::net::setItemInput(i,inputs[i].use,inputs[i].backwards,inputs[i].forwards);
+                         if(kQa&&autoplay&&!afterGoal&&raceGrid.driveLocal)for(auto& g:qaGives){
+                             if(g.player>=raceGrid.count())continue;
+                             // Opponent POW must actually target player zero; do not alter ranks.
+@@ -2282,7 +2454,21 @@ int main() {
+                                 LOGF("QA held player=%u step=%u item=%d pow=%u local_pow=%u bombs=%u blasts=%u",g.player,physicsSteps,int(h.item),unsigned(h.pow),unsigned(raceItems->hud(0).pow),bombs,blasts);
+                             }
+                         }
++                    raceItems->remoteMask=netRace?mkw::net::externalMask():0;
+                     raceItems->beforeStepNative(inputs.data(),raceGrid.count(),K::System::RaceManager::Instance()->isStageReached(K::System::RaceManager::Stage::Race),raceGrid.bulletNoEndPlayers());
++                    if(netRace){
++                        // What the other consoles decided: their racers' prizes and the hits they took.
++                        mkw::net::ItemNews news;
++                        while(mkw::net::popItemNews(news)){
++                            if(news.racer>=raceGrid.count())continue;
++                            if(news.kind==mkw::net::ItemNews::Got)raceItems->netGive(news.racer,mkw::ItemKind(news.item));
++                            else if(news.kind==mkw::net::ItemNews::Throw)raceItems->netThrow(news.racer,mkw::ItemKind(news.item),
++                                {news.position[0],news.position[1],news.position[2]},{news.direction[0],news.direction[1],news.direction[2]},
++                                {news.flight[0],news.flight[1],news.flight[2]},news.speed,news.owner<12?int(news.owner):-1,news.action==1);
++                            else raceItems->netStrike(news.racer,news.action,news.owner,{news.direction[0],news.direction[1],news.direction[2]},
++                                                      mkw::ItemKind(news.item),{news.position[0],news.position[1],news.position[2]});
++                        }
++                    }
+                     for(unsigned i=0;i<raceGrid.count();++i){
+                         const auto& h=raceItems->hud(i);const bool held=h.deployed&&h.heldCharges>0;
+                         raceGrid.ai().setItemView(i,{uint8_t(h.item),uint8_t(held?h.heldCharges:0),h.roulette!=0,held,
+@@ -2319,7 +2505,9 @@ int main() {
+                 }
+                 // QA: a fall boundary (variant 0) activation, so the retail SetCamera hold applies.
+                 if(autoplay&&lakituRespawnStep&&physicsSteps==lakituRespawnStep){auto* qaCollide=K::Kart::KartObjectManager::Instance()->object(0)->collide();qaCollide->setOobCameraPending(uint16_t(lakituRequest));qaCollide->activateOob(false,nullptr,false,false);}
++                if(netRace&&fullRace)mkw::net::applyRemotes();
+                 scenes.calc();
++                if(netRace&&fullRace)mkw::net::sendLocal(K::Kart::KartObjectManager::Instance()->object(0),buttons,unsigned((selectedMirror?-stick:stick)+7),unsigned(raceTrick),raceGrid.finished());
+                 {
+                     // The player's driver model after the kart step: its trick animation,
+                     // sparkle and sound start together (trick_presentation.hpp).
+@@ -2330,6 +2518,36 @@ int main() {
+                 if(intro.active()&&!raceWarmupFrames){intro.step();++introTick;if(!intro.active())endIntro();}
+                 if(fullRace){
+                     raceGrid.afterStep();raceItems->afterStepNative(raceGrid.count());
++                    if(netRace){
++                        // Tell the others what happened to the racers this console drives:
++                        // their prizes, what they threw or dropped, and the hits they took.
++                        static std::array<bool,12> rouletteBefore{};
++                        for(unsigned i=0;i<raceGrid.count();++i){
++                            const auto& h=raceItems->hud(i);
++                            if(mkw::net::ownsRacer(i)&&rouletteBefore[i]&&!h.roulette&&h.item!=mkw::ItemKind::None)mkw::net::sendItemGot(i,uint8_t(h.item));
++                            rouletteBefore[i]=h.roulette!=0;
++                        }
++                        static std::array<bool,mkw::RaceItems::MaxActors> actorWasActive{};
++                        const auto& actors=raceItems->actors();
++                        for(unsigned a=0;a<actors.size();++a){
++                            const auto& x=actors[a];const bool fresh=x.active&&!actorWasActive[a];actorWasActive[a]=x.active;
++                            if(!fresh||x.owner<0||!mkw::net::ownsRacer(unsigned(x.owner))||x.explosion)continue;
++                            using I=mkw::ItemKind;
++                            if(x.kind!=I::GreenShell&&x.kind!=I::RedShell&&x.kind!=I::BlueShell&&x.kind!=I::Banana&&x.kind!=I::FakeBox&&x.kind!=I::Bobomb)continue;
++                            const float pos[3]={x.position.x,x.position.y,x.position.z},vel[3]={x.velocity.x,x.velocity.y,x.velocity.z},
++                                        flight[3]={x.flightDirection.x,x.flightDirection.y,x.flightDirection.z};
++                            mkw::net::sendThrow(unsigned(x.owner),uint8_t(x.kind),pos,vel,flight,x.travelSpeed,x.target>=0?unsigned(x.target):12u,x.backwards);
++                        }
++                        raceItems->netTick();
++                        for(const auto& e:raceItems->events()){
++                            using E=mkw::ItemEffect;
++                            if(e.action<0||!mkw::net::ownsRacer(e.player))continue;
++                            if(e.effect!=E::Spin&&e.effect!=E::Launch&&e.effect!=E::Explosion&&e.effect!=E::Knockback&&e.effect!=E::Crush&&e.effect!=E::Pow)continue;
++                            const auto at=vec(K::Kart::KartObjectManager::Instance()->object(e.player)->pos());
++                            const float dir[3]={e.direction.x,e.direction.y,e.direction.z},pos[3]={at.x,at.y,at.z};
++                            mkw::net::sendHit(e.player,e.action,e.source,uint8_t(e.item),dir,pos);
++                        }
++                    }
+                     if(coinRunnersMode){
+                         const auto* race=K::System::RaceManager::Instance();
+                         coinBattle.step(race->isStageReached(K::System::RaceManager::Stage::Race)&&
+@@ -2440,6 +2658,7 @@ int main() {
+                         }
+                         if(events&Flow::EventMenuShown){menu.finish(results.finalRace());raceEvents.emit(mkw::RaceEvent::MenuShown,physicsSteps,int(results.buttonCount()));}
+                         if(events&Flow::EventOptionChosen){
++                            if(netRace)mkw::net::hostRaceOver(); // guests still racing finish now
+                             mkw::SoundSystem::instance().play(mkw::snd::id::SE_RC_PAUSE_EXIT_GAME,0);
+                             raceEvents.emit(mkw::RaceEvent::OptionChosen,physicsSteps,results.chosen());
+                             LOGF("race end option %s (race %u/%u)",results.chosen()==0?(results.finalRace()?"Next":"Next Race"):"Quit Game",vsSet.race,raceCount());
+@@ -3014,7 +3233,8 @@ int main() {
+             }
+             profiler->mark(Profile::UiPrepare);
+             if(fullRace&&!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))courseObjects.requestStadiumScreen(renderer);
+-            if(fullRace&&!effectsTest)if(const auto* bloom=mkw::courseBloom(Courses[courseChoice].archive))renderer.requestBloom(*bloom);
++            // No bloom in 3D: each eye's pass round-trips the scene target and stalls the queue.
++            if(fullRace&&!effectsTest&&!(osGet3DSliderState()>0.f)&&perfHide==12)if(const auto* bloom=mkw::courseBloom(Courses[courseChoice].archive))renderer.requestBloom(*bloom);
+             {
+                 // Fog follows the camera through KMP fog areas, one retail step per simulation step.
+                 const unsigned steps=physicsSteps>retailFogSteps?physicsSteps-retailFogSteps:0;retailFogSteps=physicsSteps;
+@@ -3097,6 +3317,17 @@ int main() {
+             // Snapshot the original chassis transform before the player pose
+             // worker reads VehicleAnimation's lazy matrices.
+             const C3D_Mtx playerShadowTransform=vehicleAnimation.body();
++            // The default player shadow is the native volume, slanted along the course's
++            // sun: shear about the kart's height so ground below it receives the shadow
++            // offset as a projection would (playerShadowLight is already length-limited).
++            C3D_Mtx playerVolumeTransform=playerShadowTransform;
++            if(false&&playerShadowLight.y< -.05f){ // sun slant: playtested, the fixed volume looked better
++                const float a=playerShadowLight.x/-playerShadowLight.y,b=playerShadowLight.z/-playerShadowLight.y;
++                const float y0=playerShadowTransform.r[1].w;
++                C3D_Mtx shear;Mtx_Identity(&shear);
++                shear.r[0].y=-a;shear.r[0].w=a*y0;shear.r[2].y=-b;shear.r[2].w=b*y0;
++                Mtx_Multiply(&playerVolumeTransform,&shear,&playerShadowTransform);
++            }
+             const bool playerBattleVisible=cameraKart->move()->battleVisible();
+             // Native soft-wall contact distinguishes an entered snow shell
+             // from the supporting ground underneath; ordinary offroad wheel
+@@ -3112,42 +3343,45 @@ int main() {
+             bool objectSupport=cameraKart->collisionData().bHasRoadVel;
+             for(unsigned w=0;w<vehicleAnimation.wheelCount();++w)
+                 objectSupport|=cameraKart->collisionData(w).bHasRoadVel;
+-            const bool playerDynamicShadow=menu.selection.dynamicShadows&&renderer.playerShadowReady();
++            // Volume shadow by default (playtested: faster and preferred); position 13 = projected.
++            const bool playerDynamicShadow=menu.selection.dynamicShadows&&renderer.playerShadowReady()&&perfHide==13;
+             // Test fixtures count clips while posing: they pose on this thread.
+             playerJobQueued=fullRace&&!animationTest&&!effectsTest&&mkw::jobWorker().running();
+             if(playerJobQueued){playerJob.reset(&runJob<decltype(posePlayer)>,&posePlayer);mkw::jobWorker().submit(playerJob);}
+             C3D_Mtx transform;Mtx_Identity(&transform);
+             renderer.setCourseLighting(true);
++            renderer.endCategory(0); // GPU profile: frame start (clears, setup)
+             if(castleScene!=mkw::castleRegion::Inside){
+-                for(auto& model:sky)renderer.draw(*model,transform,true);
++                if(!perfHit(5))for(auto& model:sky)renderer.draw(*model,transform,true);
+                 courseObjects.drawSky(renderer,physicsSteps,renderer.cameraPosition());
+             }
+-            for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),false);
++            renderer.endCategory(1); // GPU profile: sky
++            if(!perfHit(1))for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),false);
+             // Authored road decals belong below every racer shadow. Drawing
+             // them in the late glass/light pass painted over both shadow types.
+             // Coconut's coplanar glass is also the whitening layer above the
+             // submerged PalmTree trunks. It must follow those opaque objects,
+             // while still preceding racers and their native/static shadows.
+             const bool glassOverObjects=Courses[courseChoice].id==K::Course::Coconut_Mall;
+-            if(!glassOverObjects)for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true,true);
+-            profiler->mark(Profile::Course);
+-            courseObjects.draw(renderer,physicsSteps,renderer.cameraPosition());
++            if(!glassOverObjects&&!perfHit(1))for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true,true);
++            renderer.endCategory(Profile::Course);profiler->mark(Profile::Course);
++            if(!perfHit(2))courseObjects.draw(renderer,physicsSteps,renderer.cameraPosition());
+             if(glassOverObjects)for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true,true);
+-            profiler->mark(Profile::Scenery);
++            renderer.endCategory(Profile::Scenery);profiler->mark(Profile::Scenery);
+             if(coinRunnersMode)coinBattle.drawShadows(renderer,physicsSteps);
+             renderer.setCourseLighting(false);
+             if(playerJobQueued)mkw::jobWorker().finish(playerJob);else posePlayer();
+             playerJobQueued=false;
+-            if(fullRace)opponents.draw(renderer,*raceItems,vec(cameraKart->pos()),physicsSteps,
+-                playerCastsShadow&&!playerDynamicShadow?vehicleShadow.get():nullptr,&playerShadowTransform);
++            if(fullRace&&!perfHit(3))opponents.draw(renderer,*raceItems,vec(cameraKart->pos()),physicsSteps,
++                playerCastsShadow&&!playerDynamicShadow?vehicleShadow.get():nullptr,&playerVolumeTransform);
+             if(playerCastsShadow&&!fullRace&&!playerDynamicShadow){
+-                mkw::Renderer::ShadowVolume shadow{vehicleShadow.get(),playerShadowTransform};
++                mkw::Renderer::ShadowVolume shadow{vehicleShadow.get(),playerVolumeTransform};
+                 renderer.drawShadowVolumes(&shadow,1,.5f);
+             }
+-            profiler->mark(Profile::Opponents);
++            renderer.endCategory(Profile::Opponents);profiler->mark(Profile::Opponents);
+             if(fullRace)raceHud.drawWorld(renderer,*raceItems,vec(cameraKart->pos()),physicsSteps);
+             if(fullRace)lakitu.draw(renderer);
+-            profiler->mark(Profile::Items);
++            renderer.endCategory(Profile::Items);profiler->mark(Profile::Items);
+             auto drawSkinned=[&](const mkw::DriverAnimation* bank,const mkw::Model& model,const C3D_Mtx& matrix){
+                 if(bank&&bank->gpuSkinned())renderer.setSkinPalette(bank->palette(),bank->matrixCount(),21);
+                 renderer.draw(model,matrix);
+@@ -3185,7 +3419,7 @@ int main() {
+             if(coinRunnersMode){renderer.setCourseLighting(true);coinBattle.draw(renderer,physicsSteps);renderer.setCourseLighting(false);}
+             if(battleMode&&!coinRunnersMode)balloonRuntime.draw(renderer);
+             renderer.additiveColor=0;
+-            profiler->mark(Profile::Player);
++            renderer.endCategory(Profile::Player);profiler->mark(Profile::Player);
+             renderer.setCourseLighting(true);
+             Mtx_Identity(&transform);
+             for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true);
+@@ -3241,9 +3475,9 @@ int main() {
+                 const auto origin=vec(cameraKart->pos());
+                 const mkw::Renderer::ShadowVolume fallback{vehicleShadow.get(),playerShadowTransform};
+                 const auto& objectReceivers=courseObjects.shadowReceivers(origin,std::max(320.f,320.f*cameraKart->scale().y)*4.f);
+-                renderer.drawPlayerShadow(casters.data(),casterCount,receivers.data(),receiverCount,origin,playerShadowLight,cameraKart->scale().y,playerCastsShadow&&!insideSoftTerrain?&fallback:nullptr,objectReceivers.data(),unsigned(objectReceivers.size()));
++                if(!perfHit(6))renderer.drawPlayerShadow(casters.data(),casterCount,receivers.data(),receiverCount,origin,playerShadowLight,cameraKart->scale().y,playerCastsShadow&&!insideSoftTerrain?&fallback:nullptr,objectReceivers.data(),unsigned(objectReceivers.size()));
+             }
+-            if(fullRace&&lakitu.shadowVisible()){
++            if(fullRace&&lakitu.shadowVisible()&&!perfHit(6)){
+                 std::array<const mkw::Model*,256> receivers{};unsigned count=0;
+                 for(const auto& model:track)if(count<receivers.size())receivers[count++]=model.get();
+                 const auto& objects=courseObjects.shadowReceivers(lakitu.position(),2400.f);
+@@ -3251,18 +3485,19 @@ int main() {
+                                   objects.data(),unsigned(objects.size()));
+             }
+             if(mergeJudgeShadow)renderer.setShadowUnion(false);
++            renderer.endCategory(14); // diagnostics: shadows end here (GPU profile 'S')
+             renderer.drawSparks(driftEffects,sparkTexture);
+             renderer.drawEffects(raceEffects,effectTextures->data());
+             renderer.markIntroWorldEnd();
+             mkw::jobWorker().finishAll();
+             renderer.applyBloom();
+             if(fullRace)renderer.drawScreenFade(lightningFlash.opacity(),lightningFlash.white);
+-            profiler->mark(Profile::Effects);
++            renderer.endCategory(Profile::Effects);profiler->mark(Profile::Effects);
+             // Stereo layers (Mario Kart 7's): the HUD and result boards 4 px
+             // behind the screen; the full-screen wipe and the pause menu on the
+             // screen plane.
+             if(fullRace&&intro.active()){renderer.setScreenDepth(renderer.stereoLayer(mkw::stereo::HudLayer));flowUi.drawIntro(renderer,introInfo(),introTick);}
+-            if(fullRace&&!intro.active()){auto* race=K::System::RaceManager::Instance();
++            if(fullRace&&!intro.active()&&!perfHit(8)){auto* race=K::System::RaceManager::Instance();
+ 
+                 raceHud.drawOverlay(renderer,*raceItems,unsigned(race->stage()),race->timer(),battleMode?battleRank(0):raceGrid.rank(),raceGrid.lap(),battleMode?battleTicks>=balloonBattle.durationTicks():raceGrid.finished(),physicsSteps,results.finishFrame(),results.hudSlide(),camera->lookingBack());
+ }
+@@ -3270,11 +3505,15 @@ int main() {
+             if(fullRace)flowUi.drawResults(renderer,results,bottomScreen.miiPortrait());
+             renderer.setScreenDepth(0);
+             if(fullRace)flowUi.drawWipe(renderer,cameraDirector->wipeProgress());
+-            profiler->mark(Profile::Hud);
++            renderer.endCategory(Profile::Hud);profiler->mark(Profile::Hud);
+             if(fullRace&&menu.page!=mkw::UiPage::Race)menuRenderer.draw(renderer,raceQuads,false);
+             // Leaving after the end-of-race menu: the scene fader covers everything.
+             if(fullRace)renderer.drawScreenFade(results.leaveFade(),false);
+-            if(fullRace&&bottomScreen.active()&&!intro.active()){
++            // The lower screen (mini-map, standings) refreshes at 30 Hz while racing: an
++            // undrawn frame keeps its last image on the LCD (no transfer, no swap).
++            static unsigned bottomTick=0;
++            const bool bottomFrame=(bottomTick++&1)==0||results.active()||results.leaveFade()>0.f||bottomEveryFrame;
++            if(fullRace&&bottomScreen.active()&&!intro.active()&&!perfHit(7)&&bottomFrame){
+                 // The lower LCD: the race read, never written (src/race_bottom_screen.cpp).
+                 mkw::fillBottomView(bottomView,raceGrid,*raceItems,intro.active(),physicsSteps,results.leaveFade());
+                 if(battleMode){
+@@ -3285,7 +3524,7 @@ int main() {
+                 renderer.beginBottom();
+                 bottomScreen.draw(renderer,bottomView);
+             }
+-            profiler->mark(Profile::Bottom);
++            renderer.endCategory(Profile::Bottom);profiler->mark(Profile::Bottom);
+             if(qaMode&&frames%15==0){
+                 printf("\x1b[18;1H%-39s",trackLoadFailed?"ASSET LOAD FAILED: check build/package":"");
+                 auto* race=K::System::RaceManager::Instance();auto& timer=race->timerManager().currentTimer();
+diff --git a/src/menu_state.cpp b/src/menu_state.cpp
+index 45cc671..3c51c74 100755
+--- a/src/menu_state.cpp
++++ b/src/menu_state.cpp
+@@ -254,7 +254,8 @@ UiAction MenuState::input(UiInput key){
+   case UiPage::EraseLicense:enter(UiPage::LicenseSettings);cursor=1;uiFocusReset(*this);break;
+   case UiPage::LicenseSettings:enter(UiPage::MainMenu);cursor=7;uiFocusReset(*this);break;
+   case UiPage::Mode:enter(UiPage::MainMenu);break;
+-  case UiPage::EngineClass:case UiPage::VSMode:case UiPage::BattleMode:enter(UiPage::Mode);break;
++  case UiPage::VSMode:if(wireless){wireless=false;enter(UiPage::MainMenu);cursor=1;uiFocusReset(*this);break;}enter(UiPage::Mode);break;
++  case UiPage::EngineClass:case UiPage::BattleMode:enter(UiPage::Mode);break;
+   case UiPage::Character:
+    enter(selection.mode==UiMode::GrandPrix?UiPage::EngineClass:selection.mode==UiMode::VS?UiPage::VSMode:selection.mode==UiMode::Battle?UiPage::BattleMode:UiPage::Mode);break;
+   case UiPage::TeamConfirm:enter(UiPage::Character);break;
+@@ -336,12 +337,14 @@ UiAction MenuState::input(UiInput key){
+   if(cursor!=previousCursor)focusAge=0;
+   uiFocusSelect(*this,previousCursor);unavailable=false;
+  }
++ if(key.start&&page==UiPage::VSMode&&wireless){wirelessRequest=3;return UiAction::None;} // host: everyone to character selection
+  if(!key.accept&&!(key.start&&(page==UiPage::Title||page==UiPage::Strap||page==UiPage::Intro)))return UiAction::None;
+  // Corner destinations are handled separately from the grid: never turn
+  // a settings/help activation into a license choice or manual-drift selection.
+  if(cursor==auxiliarySlot()){
+   if(page==UiPage::MainMenu)enter(UiPage::LicenseSettings);
+   else if(page==UiPage::Drift)enter(UiPage::DriftHelp);
++  else if(page==UiPage::VSMode&&wireless)wirelessRequest=2;
+   else if(page==UiPage::VSMode||page==UiPage::BattleMode){rulesReturn=page;enter(page==UiPage::BattleMode?UiPage::BattleRules:UiPage::VSRules);}
+   else unavailable=true;
+   return UiAction::None;
+@@ -365,7 +368,9 @@ UiAction MenuState::input(UiInput key){
+   else if(cursor==4)selection.ledBrightness=selection.ledBrightness>=100?50:selection.ledBrightness+10;
+   break;
+  case UiPage::EraseLicense:if(cursor==0){eraseLicenseRequest=int(selection.license);enter(UiPage::License);}else{enter(UiPage::LicenseSettings);cursor=1;uiFocusReset(*this);}break;
+- case UiPage::MainMenu:if(cursor==0)enter(UiPage::Mode);else unavailable=true;break;
++ case UiPage::MainMenu:if(cursor==0)enter(UiPage::Mode);
++  else if(cursor>=1&&cursor<=3){wireless=true;enter(UiPage::VSMode);cursor=0;uiFocusReset(*this);} // Multiplayer: local wireless
++  else unavailable=true;break;
+  case UiPage::Mode:
+   if(!raceMode(UiMode(cursor))){unavailable=true;break;}
+   selection.mode=UiMode(cursor);selection.teams=false;
+@@ -376,6 +381,7 @@ UiAction MenuState::input(UiInput key){
+   selection.engineClass=UiEngineClass(cursor);enter(UiPage::Character);break;
+  case UiPage::BattleRules:case UiPage::VSRules:if(cursor==ruleOkRow()){enter(rulesReturn);cursor=auxiliarySlot();uiFocusReset(*this);}break;
+  case UiPage::VSMode:
++  if(wireless){wirelessRequest=int(cursor);break;}
+   selection.teams=cursor==1;enter(UiPage::Character);break;
+  case UiPage::BattleMode:selection.coinRunners=cursor==1;selection.teams=true;enter(UiPage::Character);break;
+  case UiPage::Character:
+@@ -398,11 +404,13 @@ UiAction MenuState::input(UiInput key){
+   if(selection.mode==UiMode::VS&&selection.vsCourses){prepareVsCourses();enter(UiPage::Confirm);}
+   else enter(selection.mode==UiMode::Battle?UiPage::BattleCup:UiPage::Cup);break;
+  case UiPage::Cup:
++  // Local wireless guests wait here for the host's course (no accidental picks).
++  if(netGuest){unavailable=true;break;}
+   if(!cupUnlocked(cursor)){unavailable=true;break;}
+   // A Grand Prix selects the whole cup. VS and Time Trials select a course.
+   if(selection.course/4!=cursor||selection.mode==UiMode::GrandPrix)selection.course=cursor*4;
+   enter(selection.mode==UiMode::GrandPrix?UiPage::Confirm:UiPage::Course);break;
+- case UiPage::Course:selection.course=selection.course/4*4+cursor;enter(selection.mode==UiMode::TimeTrials?UiPage::Ghost:UiPage::Confirm);break;
++ case UiPage::Course:if(netGuest){unavailable=true;break;}selection.course=selection.course/4*4+cursor;enter(selection.mode==UiMode::TimeTrials?UiPage::Ghost:UiPage::Confirm);break;
+  case UiPage::Ghost:enter(UiPage::Confirm);break;
+  case UiPage::BattleCup:
+   if(selection.battleStage/5!=cursor)selection.battleStage=cursor*5;
+diff --git a/src/menu_ui.cpp b/src/menu_ui.cpp
+index 3fab23d..e8b0ec1 100755
+--- a/src/menu_ui.cpp
++++ b/src/menu_ui.cpp
+@@ -16,6 +16,10 @@
+ #include <cstring>
+ 
+ namespace mkw {
++const char* uiWirelessStatus=nullptr;
++const char* uiWirelessLabels[2]={nullptr,nullptr};
++// Every character the Local Wireless page can show, requested when the page is prepared.
++const char* uiWirelessGlyphs="Local Wireless Host Join Leave Hosting - players Searching for a host... Joined as player Host not answering Host a race or join one Wireless error ABCDEF 0123456789 CPUs: On Off Players: Player Waiting for host 50cc 100cc 150cc Mirror START to begin";
+ namespace {
+ constexpr float XScale=display::MenuScaleX,YScale=display::MenuScaleY;
+ constexpr const char* CupNames[]={"Mushroom Cup","Flower Cup","Star Cup","Special Cup","Shell Cup","Banana Cup","Leaf Cup","Lightning Cup"};
+@@ -294,7 +298,7 @@ public:
+  }
+  void textSprite(unsigned index,const UiPaneInfo& pane,Pose p,uint32_t color=0xffffffff){
+   if(index>=std::size(UiSprites)||!pane.visible)return;
+-  if(layout.role==UiMenuRole::Description){
++  if(layout.role==UiMenuRole::Description&&!rawGlyphs){
+    const char* caption=UiSprites[index].text;
+    for(unsigned i=0;i<std::size(UiSprites);++i)
+     if(!std::strncmp(UiSprites[i].key,"footer_caption_",15)&&!std::strcmp(UiSprites[i].text,caption)){index=i;break;}
+@@ -457,6 +461,29 @@ public:
+   for(unsigned i=0;i<count;++i){auto cell=original;cell.x=x;cell.w=widths[i]*fit;cell.fontW*=fit;cell.fontH*=fit;cell.textAlign=0;
+    textSprite(indices[i],cell,p);x+=cell.w;}
+  }
++ // Runtime text spelled from the native-font name glyphs (no pre-rendered string needed):
++ // the Local Wireless page. Preloading requests every glyph its messages use.
++ bool rawGlyphs=false; // glyphText: draw these sprites as they are (no footer caption swap)
++ void glyphText(const char* value,const char* base,Pose p,const char* name="text"){
++  const auto* r=pane(base,name);if(!r)return;const auto& original=*r;
++  // Preloading requests each character the page can show once (a full list would
++  // pass the 128-glyph run limit and leave the last ones, the digits, unloaded).
++  const bool preload=transition&&transition->preload;if(preload)value=uiWirelessGlyphs;
++  bool seen[256]{};
++  unsigned indices[128]{},count=0;float widths[128]{},total=0;
++  for(const unsigned char* ch=reinterpret_cast<const unsigned char*>(value);*ch&&count<128;++ch){
++   if(preload){if(seen[*ch])continue;seen[*ch]=true;}
++   char key[32];std::snprintf(key,sizeof key,"name_glyph_%04x",unsigned(*ch));
++   const auto index=lookup().find(key);if(index>=std::size(UiSprites))continue;
++   indices[count]=index;const auto& glyph=UiSprites[index];
++   widths[count]=glyph.w*original.fontH/UiFontCells[0][1]*YScale/XScale;total+=widths[count++];
++  }
++  if(total<=0)return;
++  const float fit=std::min(1.f,original.w*.96f/total);
++  float x=original.x+(original.w-total*fit)*.5f;
++  for(unsigned i=0;i<count;++i){auto cell=original;cell.x=x;cell.w=widths[i]*fit;cell.fontW*=fit;cell.fontH*=fit;cell.textAlign=0;
++   rawGlyphs=true;textSprite(indices[i],cell,p);rawGlyphs=false;x+=cell.w;}
++ }
+  void text(const char* text,const char* base,Pose p={},uint32_t tint=0xffffffff,const char* name="text"){
+   const auto* r=pane(base,name);if(!r)return;
+   if(layout.page==UiPage::LicenseSettings&&layout.role==UiMenuRole::Choice){optionText(text,*r,p);return;}
+@@ -657,12 +684,12 @@ public:
+   auto key=buttonState(base,slot);panel(key.c_str(),p);
+   if(caption){text(caption,key.c_str(),p);if(state.cursor==slot)glow(base,p,caption);}
+  }
+- void chrome(const char* title,const char* description=""){
++ void chrome(const char* title,const char* description="",bool glyphs=false){
+   group(UiMenuRole::Header);panel("header",motionOnly("MenuObiTop","MenuObiTop"));
+   group(UiMenuRole::Footer);panel("footer",control("MenuObiBottom","MenuObiBottom"));
+-  const auto titlePose=control("MenuObiTitleText","MenuObiTitleText");groupPane(UiMenuRole::Title,titlePose,"header_text","text");text(title,"header_text",titlePose);
++  const auto titlePose=control("MenuObiTitleText","MenuObiTitleText");groupPane(UiMenuRole::Title,titlePose,"header_text","text");if(glyphs)glyphText(title,"header_text",titlePose);else text(title,"header_text",titlePose);
+   Pose back=control("Back","ButtonBack");groupPane(UiMenuRole::Back,back,"back_free","touch");panel("back_free",back);inPane("button_back","back_free","text",back);
+-  if(*description){const auto p=control("MenuObiInstructionText","MenuObiInstructionText");groupPane(UiMenuRole::Description,p,"footer_help","text");text(description,"footer_help",p,0xffffffff);}
++  if(*description){const auto p=control("MenuObiInstructionText","MenuObiInstructionText");groupPane(UiMenuRole::Description,p,"footer_help","text");if(glyphs)glyphText(description,"footer_help",p);else text(description,"footer_help",p,0xffffffff);}
+   group(UiMenuRole::Content);
+  }
+  void timeTrialBest(){
+@@ -976,10 +1003,11 @@ static void composeMenuImpl(const MenuState& s,const UiRaceView& race,std::vecto
+   for(unsigned i=0;i<2;++i){Pose p=control("PadEasy",i==0?"ButtonEasy":"ButtonNormal",i);c.group(UiMenuRole::Choice,i,p,"drift_free");auto base=c.buttonState("drift",i);c.movieButton(base.c_str(),p);c.movie("drift_movie_",1-i,base.c_str(),"black_base",p);c.movieOverlay(base.c_str(),p);c.text(i==0?"Automatic":"Manual",base.c_str(),p);if(s.cursor==i)c.glow("drift",p,i==0?"Automatic":"Manual");}c.chrome("Drift",UiHelpDrift[std::min(s.cursor,1u)]);
+   {Pose help=control("DriftHelp","DriftHelp",2);c.group(UiMenuRole::Auxiliary,0,help,"drift_help_free");auto helpBase=c.buttonState("drift_help",2);c.panel(helpBase.c_str(),help);c.text("Help",helpBase.c_str(),help);if(s.cursor==2)c.glow("drift_help",help,"Help");}break;
+  case UiPage::VSMode:case UiPage::BattleMode:{
+-  bool battle=s.page==UiPage::BattleMode;const char* names[]={battle?"Balloon Battle":"Solo Race",battle?"Coin Runners":"Team Race"};
+-  for(unsigned i=0;i<2;++i){Pose p=control(battle?"BattleSelect":"VSSelect",battle?(i?"ButtonCoin":"ButtonBalloon"):(i?"ButtonTeam":"ButtonIndividual"),i);c.group(UiMenuRole::Choice,i,p,battle?"battle_free":"vs_free");auto base=c.buttonState(battle?"battle":"vs",i);c.movieButton(base.c_str(),p);c.movie(battle?"battle_mode_movie_":"vs_movie_",i,base.c_str(),"black_base",p);c.movieOverlay(base.c_str(),p);c.text(names[i],base.c_str(),p);if(s.cursor==i)c.glow(battle?"battle":"vs",p,names[i]);}
+-  c.chrome(battle?"Battle":"VS");
+-  {auto p=control("RuleSetting","ButtonRuleSetting",2);c.group(UiMenuRole::Auxiliary,0,p,"drift_help_free");auto base=c.buttonState("drift_help",2);c.panel(base.c_str(),p);c.text("Rules",base.c_str(),p);if(s.cursor==2)c.glow("drift_help",p,"Rules");}break;
++  bool battle=s.page==UiPage::BattleMode;const bool wireless=!battle&&s.wireless;
++  const char* names[]={battle?"Balloon Battle":wireless?(uiWirelessLabels[0]?uiWirelessLabels[0]:"Host"):"Solo Race",battle?"Coin Runners":wireless?(uiWirelessLabels[1]?uiWirelessLabels[1]:"Join"):"Team Race"};
++  for(unsigned i=0;i<2;++i){Pose p=control(battle?"BattleSelect":"VSSelect",battle?(i?"ButtonCoin":"ButtonBalloon"):(i?"ButtonTeam":"ButtonIndividual"),i);c.group(UiMenuRole::Choice,i,p,battle?"battle_free":"vs_free");auto base=c.buttonState(battle?"battle":"vs",i);c.movieButton(base.c_str(),p);c.movie(battle?"battle_mode_movie_":"vs_movie_",i,base.c_str(),"black_base",p);c.movieOverlay(base.c_str(),p);if(wireless)c.glyphText(names[i],base.c_str(),p);else c.text(names[i],base.c_str(),p);if(s.cursor==i)c.glow(battle?"battle":"vs",p,names[i]);}
++  if(wireless)c.chrome("Local Wireless",uiWirelessStatus&&*uiWirelessStatus?uiWirelessStatus:" ",true);else c.chrome(battle?"Battle":"VS");
++  {const char* aux=wireless?"Leave":"Rules";auto p=control("RuleSetting","ButtonRuleSetting",2);c.group(UiMenuRole::Auxiliary,0,p,"drift_help_free");auto base=c.buttonState("drift_help",2);c.panel(base.c_str(),p);if(wireless)c.glyphText(aux,base.c_str(),p);else c.text(aux,base.c_str(),p);if(s.cursor==2)c.glow("drift_help",p,aux);}break;
+  }
+  case UiPage::TeamConfirm:{
+   auto teams=offlineVsTeams(true,s.selection.humanTeam);unsigned slots[2]{};
+@@ -1356,6 +1384,7 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
+  top.clear();bottom.clear();top.reserve(source.size());bottom.reserve(source.size());
+  if(unchangedMenu(state.page)){top=source;for(auto& q:top)q.bottom=false;return;}
+  const bool fullMovie=state.page==UiPage::Course||state.page==UiPage::BattleStage||state.page==UiPage::Confirm;
++ float glyphRunX=0; // Description letters laid side by side
+  for(const auto& q:source){
+   const auto& g=q.menu;const unsigned i=g.group;
+   const bool upperConfirm=g.page==UiPage::Confirm;
+@@ -1376,6 +1405,12 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
+    placeMenuQuad(q,{14,6,372,20},false,top,true);if(!upperConfirm)placeMenuQuad(q,{12,6,296,20},true,bottom,true);break;
+   case UiMenuRole::Description:
+    {auto text=q;const auto& a=UiSprites[q.sprite];
++    // Spelled-out text (name glyphs, Local Wireless page): letters side by side; the
++    // pass below centres the whole line.
++    if(!std::strncmp(a.key,"name_glyph_",11)){
++     const float h=12.f,w=h*a.w/a.h;text.x=glyphRunX;glyphRunX+=w;
++     text.y=223;text.w=w;text.h=h;text.affine=false;text.bottom=false;top.push_back(text);break;
++    }
+     const float h=std::min(14.f,384.f*a.h/a.w),w=h*a.w/a.h;
+     text.x=200-w*.5f;text.y=222;text.w=w;text.h=h;text.affine=false;
+     text.bottom=false;top.push_back(text);break;}
+diff --git a/src/netplay.cpp b/src/netplay.cpp
+new file mode 100644
+index 0000000..a6ce452
+--- /dev/null
++++ b/src/netplay.cpp
+@@ -0,0 +1,720 @@
++// Local wireless VS races, 2 to 12 racers (see include/mkw/netplay.hpp).
++#include <mkw/netplay.hpp>
++#include <3ds.h>
++#include <game/kart/KartObject.hh>
++#include <game/kart/KartObjectProxy.hh>
++#include <game/kart/KartObjectManager.hh>
++#include <game/kart/KartDynamics.hh>
++#include <game/kart/KartMove.hh>
++#include <game/system/KPadController.hh>
++#include <game/system/KPadDirector.hh>
++#include <game/system/RaceManager.hh>
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace mkw::net {
++namespace {
++constexpr u32 CommId = 0x4D4B5733;   // "MKW3": only this game's networks are seen.
++constexpr u8 MaxNodes = 12;
++constexpr unsigned MaxSlots = 12;    // link slot = UDS node ID - 1; the host is slot 0
++constexpr unsigned MaxRacers = 12;   // race ID = grid position
++constexpr u8 NoSlot = 0xff;          // a roster entry without a console: a CPU
++constexpr u8 Channel = 1;
++constexpr char Passphrase[] = "mkw-3ds local play v1";
++constexpr u8 Magic = 0x6B;
++constexpr u8 Protocol = 7;           // Bump when packets change: every console must match.
++constexpr unsigned SendEvery = 3;    // ticks between kart updates: 20 a second
++
++enum class Type : u8 { Hello = 1, Start, Accept, Decline, Roster, Ready, Go, State, Bundle, Bye, Ping, Pong, Event, RaceOver, LobbyGo };
++struct Header { u8 magic, protocol, type, count; u16 raceId, pad; };
++struct StartPacket { Header h; u8 course, engineClass, mirror, items; };
++struct AcceptPacket { Header h; u16 garage, pad; u16 name[10]; };
++struct RosterEntry { u8 slot, pad; u16 garage; u16 name[10]; };
++struct RosterPacket { Header h; RosterEntry e[MaxRacers]; };
++struct PingPacket { Header h; u64 sentAt; };
++// One kart, compact: 36 bytes. Twelve fit one bundle of 440 bytes.
++struct KartState {
++    u8 racer, buttons, stickTrick, flags;  // stick 0..14 in the low nibble, trick above;
++                                           // flags: 1 finished, 2 use item, 4 back, 8 forward
++    u32 tick;                              // the sending console's simulation tick
++    float pos[3];
++    s16 vel[3];                            // per tick, 1/64 units
++    s16 rot[4];                            // quaternion x,y,z,w, 1/32767
++    s16 speed;                             // 1/64 units
++};
++struct StatePacket { Header h; KartState k; };
++struct BundlePacket { Header h; KartState k[MaxRacers]; };
++// An item event, sent three times; the host passes guests' events on to everyone.
++struct NetEvent { u8 kind, origin, item, owner; s8 action; u8 pad; u16 seq; float direction[3], position[3], flight[3], speed; };
++struct EventPacket { Header h; NetEvent e; };
++
++s16 pack(float v, float scale) { return s16(std::clamp(std::lround(v * scale), -32767L, 32767L)); }
++
++// ---- Link ----
++Role role_ = Role::None;
++bool up_ = false;
++udsBindContext bind_{};
++u16 myNode_ = 0;
++unsigned mySlot_ = 0;
++u64 hostLastRecv_ = 0;                      // guest: the host's last packet
++std::array<u64, MaxSlots> guestLastRecv_{}; // host: each guest's last packet
++u64 lastHello_ = 0, lastPing_ = 0;
++u16 raceId_ = 0;
++
++// ---- Offer / roster ----
++bool offerPending_ = false, acceptedEarly_ = false; StartInfo offer_{}; u16 earlyGarage_ = 0;
++std::array<int, MaxSlots> answers_{};       // host: 0 none, 1 accepted, -1 declined
++std::array<u16, MaxSlots> answerGarage_{};
++bool rosterReceived_ = false;
++unsigned rosterCount_ = 0;
++std::array<u8, MaxRacers> rosterSlot_{};    // by race ID; NoSlot for a CPU
++std::array<u16, MaxRacers> rosterGarage_{};
++std::array<std::array<u16, 10>, MaxRacers> rosterName_{};
++std::array<std::array<u16, 10>, MaxSlots> answerName_{};
++std::array<u16, 10> myName_{};
++bool hostLost_ = false;
++unsigned myRacer_ = 0;                      // this console's race ID
++std::array<u8, MaxRacers> indexRacer_{};    // racer index -> race ID (index 0 = this console)
++std::array<u8, MaxRacers> racerIndex_{};    // race ID -> racer index
++
++// ---- Race ----
++bool inRace_ = false, go_ = false, raceOver_ = false, lobbyGo_ = false;
++std::array<bool, MaxSlots> ready_{};        // host: guests that loaded
++struct Remote { bool have = false, haveOffset = false; KartState k{}; u64 arrival = 0; int minOffset = 0; };
++std::array<Remote, MaxRacers> remotes_{};   // by race ID
++u32 localTick_ = 0;
++std::array<std::array<float, 3>, MaxRacers> prevPos_{}; bool havePrev_ = false; // by racer index (owned ones)
++std::array<u8, MaxRacers> itemBits_{};      // by racer index: buttons since the last update (use is OR-ed)
++u64 readyWaitStart_ = 0, lastReadySend_ = 0, goSentAt_ = 0; unsigned goRepeats_ = 0;
++u16 eventSeq_ = 0;
++std::array<u16, MaxRacers> lastSeq_{}; std::array<bool, MaxRacers> haveSeq_{};
++std::array<ItemNews, 48> news_{}; unsigned newsHead_ = 0, newsCount_ = 0;
++
++// ---- Statistics ----
++unsigned sent_ = 0, sendFails_ = 0, received_ = 0, maxBatch_ = 0, rttMs_ = 0, rttMinMs_ = ~0u;
++
++u64 now() { return svcGetSystemTick(); }
++u64 ms(u64 t) { return t * (SYSCLOCK_ARM11 / 1000); }
++unsigned toMs(u64 ticks) { return unsigned(ticks / (SYSCLOCK_ARM11 / 1000)); }
++
++// SD writes can stall a frame, so during a race lines wait in memory until it ends.
++char logBuffer_[6144]; size_t logUsed_ = 0; bool logHold_ = false;
++void flushLog() {
++    if (!logUsed_) return;
++    if (FILE* f = fopen("sdmc:/3ds/mkw-3ds/netplay.log", "a")) { fwrite(logBuffer_, 1, logUsed_, f); fclose(f); }
++    logUsed_ = 0;
++}
++void log(const char* fmt, ...) {
++    char text[200];
++    va_list a; va_start(a, fmt); vsnprintf(text, sizeof text, fmt, a); va_end(a);
++    char line[224]; const int n = snprintf(line, sizeof line, "[%.3f] %s\n", double(now()) / SYSCLOCK_ARM11, text);
++    if (n <= 0) return;
++    if (logUsed_ + size_t(n) > sizeof logBuffer_) { if (logHold_) return; flushLog(); }
++    std::memcpy(logBuffer_ + logUsed_, line, size_t(n)); logUsed_ += size_t(n);
++    if (!logHold_) flushLog();
++}
++
++Header header(Type t, u8 count = 0) { Header h{}; h.magic = Magic; h.protocol = Protocol; h.type = u8(t); h.count = count; h.raceId = raceId_; return h; }
++void sendTo(u16 node, const void* data, size_t size) {
++    if (!up_) return;
++    const Result r = udsSendTo(node, Channel, UDS_SENDFLAG_Default, data, size);
++    if (R_FAILED(r)) { if (sendFails_++ < 8) log("send failed %08lx", (unsigned long)r); }
++    else ++sent_;
++}
++// Guests only ever talk to the host; the host talks to everyone at once.
++void send(const void* data, size_t size) { sendTo(role_ == Role::Host ? UDS_BROADCAST_NETWORKNODEID : UDS_HOST_NETWORKNODEID, data, size); }
++void sendSimple(Type t) { const Header h = header(t); send(&h, sizeof h); }
++
++bool guestAlive(unsigned slot) { return slot && slot < MaxSlots && guestLastRecv_[slot] && now() - guestLastRecv_[slot] < ms(5000); }
++unsigned guestCount() { unsigned n = 0; for (unsigned s = 1; s < MaxSlots; ++s) n += guestAlive(s); return n; }
++bool isCpu(unsigned racer) { return racer < rosterCount_ && rosterSlot_[racer] == NoSlot; }
++int racerOfSlot(unsigned slot) { for (unsigned r = 0; r < rosterCount_; ++r) if (rosterSlot_[r] == slot) return int(r); return -1; }
++int indexOf(unsigned racer) { return racer < rosterCount_ ? int(racerIndex_[racer]) : -1; }
++
++void storeRemote(const KartState& k) {
++    if (k.racer >= rosterCount_ || k.racer == myRacer_) return;
++    if (role_ == Role::Host && isCpu(k.racer)) return; // the host drives its CPUs itself
++    Remote& r = remotes_[k.racer];
++    if (r.have && k.tick <= r.k.tick) return;
++    r.k = k; r.have = true; r.arrival = now();
++    // The smallest local-minus-remote tick gap: the two clocks' offset at the best latency.
++    const int offset = int(localTick_) - int(k.tick);
++    if (!r.haveOffset || offset < r.minOffset) { r.minOffset = offset; r.haveOffset = true; }
++}
++
++void queueEvent(const NetEvent& e) {
++    const int racer = indexOf(e.origin);
++    if (racer <= 0 || newsCount_ >= news_.size()) return; // not a remote racer here, or full
++    ItemNews n; n.kind = ItemNews::Kind(e.kind); n.racer = u8(racer); n.item = e.item; n.action = e.action;
++    const int owner = e.owner < rosterCount_ ? indexOf(e.owner) : -1; n.owner = owner >= 0 ? u8(owner) : 12;
++    for (int a = 0; a < 3; ++a) { n.direction[a] = e.direction[a]; n.position[a] = e.position[a]; n.flight[a] = e.flight[a]; }
++    n.speed = e.speed;
++    news_[(newsHead_ + newsCount_++) % news_.size()] = n;
++}
++
++void sendEvent(unsigned racerIndex, NetEvent e) {
++    if (racerIndex >= rosterCount_) return;
++    e.origin = indexRacer_[racerIndex]; e.seq = ++eventSeq_;
++    EventPacket p; p.h = header(Type::Event); p.e = e;
++    for (int i = 0; i < 3; ++i) send(&p, sizeof p);
++}
++
++void handle(const u8* data, size_t size, u16 source) {
++    if (size < sizeof(Header)) return;
++    Header h; std::memcpy(&h, data, sizeof h);
++    if (h.magic != Magic) return;
++    if (h.protocol != Protocol) { static bool said = false; if (!said) { said = true; log("console with protocol %u (ours %u): ignored", h.protocol, Protocol); } return; }
++    ++received_;
++    const unsigned from = source >= 1 && source <= MaxSlots ? source - 1u : MaxSlots;
++    if (role_ == Role::Host) { if (from && from < MaxSlots) { if (!guestLastRecv_[from]) log("guest %u joined", from); guestLastRecv_[from] = now(); } }
++    else hostLastRecv_ = now();
++    switch (Type(h.type)) {
++    case Type::Hello: break;
++    case Type::Start:
++        if (role_ == Role::Guest && size >= sizeof(StartPacket)) {
++            StartPacket p; std::memcpy(&p, data, sizeof p);
++            if (offerPending_ && raceId_ == h.raceId) break;   // a repeat
++            if (rosterReceived_ && raceId_ == h.raceId) break; // already answered
++            raceId_ = h.raceId; offerPending_ = true; rosterReceived_ = false; acceptedEarly_ = false;
++            offer_ = {p.course, p.engineClass, p.mirror != 0, p.items};
++            log("offer race=%u course=%u class=%u", raceId_, p.course, p.engineClass);
++        }
++        break;
++    case Type::Accept:
++        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots && size >= sizeof(AcceptPacket)) {
++            AcceptPacket p; std::memcpy(&p, data, sizeof p);
++            answers_[from] = 1; answerGarage_[from] = p.garage; std::memcpy(answerName_[from].data(), p.name, sizeof p.name);
++        }
++        break;
++    case Type::Decline:
++        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots) answers_[from] = -1;
++        break;
++    case Type::Roster:
++        if (role_ == Role::Guest && h.raceId == raceId_ && !rosterReceived_ && h.count <= MaxRacers &&
++            size >= sizeof(Header) + h.count * sizeof(RosterEntry)) {
++            RosterPacket p{}; std::memcpy(&p, data, std::min(size, sizeof p));
++            rosterCount_ = h.count;
++            for (unsigned i = 0; i < rosterCount_; ++i) { rosterSlot_[i] = p.e[i].slot; rosterGarage_[i] = p.e[i].garage; std::memcpy(rosterName_[i].data(), p.e[i].name, sizeof p.e[i].name); }
++            rosterReceived_ = true;
++        }
++        break;
++    case Type::Ready:
++        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots && !ready_[from]) { ready_[from] = true; log("guest %u loaded", from); }
++        break;
++    case Type::Go:
++        if (role_ == Role::Guest && h.raceId == raceId_ && !go_) { go_ = true; log("go race=%u", raceId_); }
++        break;
++    case Type::LobbyGo:
++        if (role_ == Role::Guest && !inRace_ && !lobbyGo_) { lobbyGo_ = true; log("lobby go"); }
++        break;
++    case Type::RaceOver:
++        if (role_ == Role::Guest && h.raceId == raceId_ && inRace_ && !raceOver_) { raceOver_ = true; log("race over"); }
++        break;
++    case Type::State:
++        if (role_ == Role::Host && inRace_ && h.raceId == raceId_ && size >= sizeof(StatePacket)) {
++            StatePacket p; std::memcpy(&p, data, sizeof p);
++            const int racer = racerOfSlot(from); // trust the link, not the packet
++            if (racer < 0) break;
++            p.k.racer = u8(racer);
++            storeRemote(p.k);
++        }
++        break;
++    case Type::Bundle:
++        if (role_ == Role::Guest && inRace_ && h.raceId == raceId_ && h.count <= MaxRacers &&
++            size >= sizeof(Header) + h.count * sizeof(KartState)) {
++            BundlePacket p; std::memcpy(&p, data, std::min(size, sizeof p));
++            for (unsigned i = 0; i < h.count; ++i) storeRemote(p.k[i]);
++        }
++        break;
++    case Type::Event:
++        if (inRace_ && h.raceId == raceId_ && size >= sizeof(EventPacket)) {
++            EventPacket p; std::memcpy(&p, data, sizeof p);
++            if (role_ == Role::Host) { const int racer = racerOfSlot(from); if (racer < 0) break; p.e.origin = u8(racer); } // trust the link
++            const unsigned o = p.e.origin;
++            if (o >= rosterCount_ || o == myRacer_ || (role_ == Role::Host && isCpu(o))) break;
++            if (haveSeq_[o] && s16(u16(p.e.seq - lastSeq_[o])) <= 0) break; // a copy already seen
++            haveSeq_[o] = true; lastSeq_[o] = p.e.seq;
++            queueEvent(p.e);
++            if (role_ == Role::Host) for (int i = 0; i < 3; ++i) send(&p, sizeof p); // pass it on
++        }
++        break;
++    case Type::Ping:
++        if (size >= sizeof(PingPacket)) { PingPacket p; std::memcpy(&p, data, sizeof p); p.h = header(Type::Pong); sendTo(source, &p, sizeof p); }
++        break;
++    case Type::Pong:
++        if (size >= sizeof(PingPacket)) {
++            PingPacket p; std::memcpy(&p, data, sizeof p);
++            rttMs_ = toMs(now() - p.sentAt); rttMinMs_ = std::min(rttMinMs_, rttMs_);
++        }
++        break;
++    case Type::Bye:
++        if (role_ == Role::Host && from < MaxSlots) { guestLastRecv_[from] = 0; log("guest %u left", from); }
++        else if (role_ == Role::Guest) { hostLastRecv_ = 0; log("host left"); }
++        break;
++    }
++}
++
++void restoreLowerScreen() {
++    // consoleInit made it RGB565 and single-buffered; the renderer needs the defaults.
++    gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
++    gfxSetDoubleBuffering(GFX_BOTTOM, true);
++}
++
++void stopUds() {
++    if (!up_) return;
++    sendSimple(Type::Bye);
++    if (role_ == Role::Host) udsDestroyNetwork(); else udsDisconnectNetwork();
++    udsUnbind(&bind_);
++    up_ = false;
++}
++
++void learnNode() {
++    udsConnectionStatus status{};
++    if (R_SUCCEEDED(udsGetConnectionStatus(&status))) myNode_ = status.cur_NetworkNodeID;
++    mySlot_ = myNode_ >= 1 && myNode_ <= MaxSlots ? myNode_ - 1u : 0;
++    log("node %u slot %u", myNode_, mySlot_);
++}
++
++void beginRace() {
++    // Racer 0 is this console; the others follow in grid order.
++    const int me = racerOfSlot(mySlot_); myRacer_ = me >= 0 ? unsigned(me) : 0;
++    unsigned n = 1; indexRacer_[0] = u8(myRacer_); racerIndex_[myRacer_] = 0;
++    for (unsigned r = 0; r < rosterCount_ && n < MaxRacers; ++r) if (r != myRacer_) { indexRacer_[n] = u8(r); racerIndex_[r] = u8(n); ++n; }
++    inRace_ = true; go_ = false; raceOver_ = false; hostLost_ = false; ready_.fill(false); remotes_ = {};
++    localTick_ = 0; havePrev_ = false; itemBits_.fill(0); readyWaitStart_ = 0; lastReadySend_ = 0; goSentAt_ = 0; goRepeats_ = 0;
++    eventSeq_ = 0; haveSeq_.fill(false); newsHead_ = newsCount_ = 0;
++    log("race %u begins: %u racers, this console is racer %u", raceId_, rosterCount_, myRacer_);
++    logHold_ = true;
++}
++
++// ---- Background search for a host (a scan blocks for a while) ----
++bool exitHooked_ = false, joining_ = false;
++char status_[96] = "";
++Thread scanThread_ = nullptr; volatile bool scanStop_ = false;
++void scanOnce() {
++    static u8 scan[0x4000];
++    udsNetworkScanInfo* networks = nullptr; size_t total = 0;
++    Result r = udsScanBeacons(scan, sizeof scan, &networks, &total, CommId, 0, nullptr, false);
++    if (R_SUCCEEDED(r) && total) {
++        r = udsConnectNetwork(&networks[0].network, Passphrase, sizeof Passphrase, &bind_,
++                              UDS_BROADCAST_NETWORKNODEID, UDSCONTYPE_Client, Channel, UDS_DEFAULT_RECVBUFSIZE);
++        if (R_SUCCEEDED(r)) { learnNode(); hostLastRecv_ = now(); up_ = true; joining_ = false; log("joined (menu)"); }
++        else log("udsConnectNetwork %08lx", (unsigned long)r);
++    }
++    free(networks);
++}
++void scanMain(void*) {
++    while (!scanStop_ && joining_ && !up_) { scanOnce(); for (int i = 0; i < 10 && !scanStop_; ++i) svcSleepThread(50 * 1000000LL); }
++}
++void stopScan() {
++    if (!scanThread_) return;
++    scanStop_ = true; threadJoin(scanThread_, U64_MAX); threadFree(scanThread_); scanThread_ = nullptr;
++}
++bool startUds() {
++    const Result r = udsInit(0x3000, nullptr);
++    if (R_SUCCEEDED(r)) { if (!exitHooked_) { exitHooked_ = true; atexit(shutdown); } return true; }
++    log("udsInit %08lx", (unsigned long)r);
++    snprintf(status_, sizeof status_, "Wireless error %08lX", (unsigned long)r);
++    return false;
++}
++void resetLink() { guestLastRecv_.fill(0); hostLastRecv_ = 0; raceId_ = 0; offerPending_ = acceptedEarly_ = rosterReceived_ = false; inRace_ = false; status_[0] = 0; }
++} // namespace
++
++Role role() { return role_; }
++bool connected() {
++    if (!up_) return false;
++    if (role_ == Role::Host) return guestCount() > 0;
++    return hostLastRecv_ && now() - hostLastRecv_ < ms(5000);
++}
++
++void poll() {
++    if (scanThread_ && (up_ || !joining_)) stopScan(); // the search ended: collect its thread
++    if (!up_) return;
++    // Read until the queue is empty. (udsWaitDataAvailable is not a reliable
++    // "anything waiting?" test: gating on it left packets queued for seconds.)
++    unsigned batch = 0;
++    for (; batch < 1024; ++batch) {
++        alignas(8) static u8 buffer[UDS_DATAFRAME_MAXSIZE];
++        size_t actual = 0; u16 source = 0;
++        if (R_FAILED(udsPullPacket(&bind_, buffer, sizeof buffer, &actual, &source)) || !actual) break;
++        handle(buffer, actual, source);
++    }
++    maxBatch_ = std::max(maxBatch_, batch);
++    if (now() - lastHello_ > ms(1000)) { lastHello_ = now(); sendSimple(Type::Hello); }
++    if (now() - lastPing_ > ms(500)) { lastPing_ = now(); PingPacket p{}; p.h = header(Type::Ping); p.sentAt = now(); send(&p, sizeof p); }
++}
++
++void bootLobby() {
++    hidScanInput();
++    if (!(hidKeysHeld() & (KEY_L | KEY_R))) return;
++    static PrintConsole console;
++    consoleInit(GFX_BOTTOM, &console);
++    auto frame = [] { gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); };
++    auto wait = [&](const char* text) {
++        printf("%s\n\nPress A to continue.\n", text);
++        while (aptMainLoop()) { hidScanInput(); if (hidKeysDown() & (KEY_A | KEY_B | KEY_START)) break; frame(); }
++    };
++    printf("\x1b[2J== MKW local wireless ==\n\n"
++           "(Also in the main menu: Multiplayer.)\n\n"
++           "A: host\nB: join\nSTART: play alone\n");
++    Role chosen = Role::None;
++    while (aptMainLoop()) {
++        hidScanInput(); const u32 down = hidKeysDown();
++        if (down & KEY_A) { chosen = Role::Host; break; }
++        if (down & KEY_B) { chosen = Role::Guest; break; }
++        if (down & KEY_START) break;
++        frame();
++    }
++    if (chosen == Role::None) { restoreLowerScreen(); return; }
++    if (chosen == Role::Host) hostBegin(); else joinBegin();
++    const u64 start = now(); unsigned shown = ~0u;
++    while (aptMainLoop() && role_ != Role::None) {
++        hidScanInput(); const u32 down = hidKeysDown();
++        if (down & KEY_START) { shutdown(); break; }
++        poll();
++        const unsigned n = role_ == Role::Host ? guestCount() + 1 : connected() ? 2 : 0;
++        if (n != shown) { shown = n; printf("\x1b[10;0H%s          \n", statusText()); }
++        if (role_ == Role::Host && n > 1 && (down & KEY_A)) break;
++        if (role_ == Role::Guest && connected()) break;
++        if (role_ == Role::Guest && now() - start > ms(30000)) { shutdown(); break; }
++        frame();
++    }
++    if (role_ != Role::None) wait(role_ == Role::Host ? "Hosting." : "Joined.");
++    restoreLowerScreen();
++}
++
++void hostBegin() {
++    if (role_ != Role::None) return;
++    if (!startUds()) return;
++    resetLink();
++    udsNetworkStruct network;
++    udsGenerateDefaultNetworkStruct(&network, CommId, 0, MaxNodes);
++    const Result r = udsCreateNetwork(&network, Passphrase, sizeof Passphrase, &bind_, Channel, UDS_DEFAULT_RECVBUFSIZE);
++    if (R_FAILED(r)) {
++        log("udsCreateNetwork %08lx", (unsigned long)r); udsExit();
++        snprintf(status_, sizeof status_, "Wireless error %08lX", (unsigned long)r);
++        return;
++    }
++    role_ = Role::Host; up_ = true; learnNode(); log("hosting");
++}
++
++void joinBegin() {
++    if (role_ != Role::None) return;
++    if (!startUds()) return;
++    resetLink();
++    role_ = Role::Guest; joining_ = true; scanStop_ = false;
++    s32 priority = 0x30; svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
++    scanThread_ = threadCreate(scanMain, nullptr, 0x4000, int(std::min<s32>(priority + 1, 0x3F)), -2, false);
++    if (!scanThread_) { log("scan thread failed"); joining_ = false; shutdown(); }
++}
++
++const char* statusText() {
++    // Short: one footer line, characters limited to menu_ui's uiWirelessGlyphs.
++    if (role_ == Role::None) return status_[0] ? status_ : "Host a race or join one";
++    if (role_ == Role::Host) {
++        const unsigned n = guestCount() + 1;
++        snprintf(status_, sizeof status_, n > 1 ? "Hosting - %u players - START to begin" : "Hosting - %u player", n);
++        return status_;
++    }
++    if (joining_ || !up_) return "Searching for a host...";
++    snprintf(status_, sizeof status_, connected() ? "Joined as player %u" : "Host not answering", mySlot_ + 1);
++    return status_;
++}
++
++void shutdown() {
++    if (role_ == Role::None) return;
++    joining_ = false; stopScan();
++    stopUds(); udsExit(); role_ = Role::None;
++}
++
++bool hostStartRace(const StartInfo& info, uint16_t hostGarage, const uint16_t* cpuGarages, unsigned cpuCount) {
++    if (role_ != Role::Host || !connected()) return false;
++    ++raceId_; answers_.fill(0);
++    StartPacket p{}; p.h = header(Type::Start);
++    p.course = info.course; p.engineClass = info.engineClass; p.mirror = info.mirror; p.items = info.items;
++    log("offer race=%u course=%u to %u guests", raceId_, info.course, guestCount());
++    const u64 start = now(); u64 lastSend = 0;
++    while (aptMainLoop() && now() - start < ms(5000)) {
++        if (now() - lastSend > ms(250)) { lastSend = now(); send(&p, sizeof p); }
++        poll();
++        bool all = true;
++        for (unsigned s = 1; s < MaxSlots; ++s) if (guestAlive(s) && !answers_[s]) all = false;
++        if (all) break;
++        svcSleepThread(5 * 1000000LL);
++    }
++    // The roster, in grid order: the host, every guest that accepted, then the CPUs.
++    RosterPacket roster{}; unsigned n = 0;
++    auto entry = [](u8 slot, u16 garage, const u16* name) { RosterEntry e{}; e.slot = slot; e.garage = garage; if (name) std::memcpy(e.name, name, sizeof e.name); return e; };
++    roster.e[n++] = entry(0, hostGarage, myName_.data());
++    for (unsigned s = 1; s < MaxSlots && n < MaxRacers; ++s) if (answers_[s] == 1) roster.e[n++] = entry(u8(s), answerGarage_[s], answerName_[s].data());
++    const unsigned humans = n;
++    for (unsigned c = 0; c < cpuCount && n < MaxRacers; ++c) roster.e[n++] = entry(NoSlot, cpuGarages[c], nullptr);
++    rosterCount_ = n;
++    for (unsigned i = 0; i < n; ++i) { rosterSlot_[i] = roster.e[i].slot; rosterGarage_[i] = roster.e[i].garage; std::memcpy(rosterName_[i].data(), roster.e[i].name, sizeof roster.e[i].name); }
++    roster.h = header(Type::Roster, u8(n));
++    const size_t size = sizeof(Header) + n * sizeof(RosterEntry);
++    for (int i = 0; i < 4; ++i) { send(&roster, size); svcSleepThread(2 * 1000000LL); }
++    log("race %u roster: %u players, %u CPUs", raceId_, humans, n - humans);
++    if (humans < 2) return false;
++    beginRace();
++    return true;
++}
++
++bool guestStartPending(StartInfo& out) {
++    if (role_ != Role::Guest) return false;
++    poll();
++    if (!offerPending_) return false;
++    out = offer_;
++    return true;
++}
++
++void guestAcceptEarly(uint16_t garage) {
++    if (role_ != Role::Guest || !offerPending_ || acceptedEarly_) return;
++    acceptedEarly_ = true; earlyGarage_ = garage;
++    AcceptPacket p{}; p.h = header(Type::Accept); p.garage = garage; std::memcpy(p.name, myName_.data(), sizeof p.name);
++    for (int i = 0; i < 3; ++i) send(&p, sizeof p);
++    log("accepted race %u early", raceId_);
++}
++
++bool guestAnswer(bool accept, uint16_t garage) {
++    offerPending_ = false;
++    if (acceptedEarly_) { acceptedEarly_ = false; garage = earlyGarage_; } // the host was told this one
++    if (!accept) { sendSimple(Type::Decline); log("declined race %u", raceId_); return false; }
++    AcceptPacket p{}; p.h = header(Type::Accept); p.garage = garage; std::memcpy(p.name, myName_.data(), sizeof p.name);
++    const u64 start = now(); u64 lastSend = 0;
++    while (aptMainLoop() && !rosterReceived_ && now() - start < ms(7000)) {
++        if (now() - lastSend > ms(250)) { lastSend = now(); send(&p, sizeof p); }
++        poll();
++        svcSleepThread(5 * 1000000LL);
++    }
++    if (!rosterReceived_) { log("race %u: no roster", raceId_); return false; }
++    if (racerOfSlot(mySlot_) < 0 || rosterCount_ < 2) { log("race %u: not in the roster", raceId_); return false; }
++    beginRace();
++    return true;
++}
++
++bool inRace() { return inRace_; }
++void setLocalName(const uint16_t* name) { myName_.fill(0); if (name) std::memcpy(myName_.data(), name, sizeof myName_); }
++const uint16_t* nameFor(unsigned index) {
++    if (!inRace_ || index >= rosterCount_) return nullptr;
++    const auto& n = rosterName_[indexRacer_[index]];
++    return n[0] ? n.data() : nullptr;
++}
++bool hostLost() { return hostLost_; }
++unsigned raceCount() { return inRace_ ? rosterCount_ : 1; }
++uint16_t garageFor(unsigned index) { return index < rosterCount_ ? rosterGarage_[indexRacer_[index]] : 0; }
++uint8_t startPositionFor(unsigned index) { return index < rosterCount_ ? u8(indexRacer_[index] + 1) : 0; }
++bool ownsRacer(unsigned index) {
++    if (!inRace_ || index >= rosterCount_) return index == 0;
++    return index == 0 || hostLost_ || (role_ == Role::Host && isCpu(indexRacer_[index]));
++}
++uint16_t externalMask() {
++    if (!inRace_) return 0;
++    uint16_t mask = 0;
++    for (unsigned i = 1; i < rosterCount_; ++i) if (!ownsRacer(i)) mask |= uint16_t(1u << i);
++    return mask;
++}
++
++bool raceReady() {
++    if (!inRace_) return true;
++    poll();
++    if (!readyWaitStart_) readyWaitStart_ = now();
++    const bool timedOut = now() - readyWaitStart_ > ms(60000);
++    if (role_ == Role::Guest) {
++        if (now() - lastReadySend_ > ms(250)) { lastReadySend_ = now(); sendSimple(Type::Ready); }
++        if (go_ || timedOut) { log(go_ ? "go after %.1f s" : "no go: racing anyway", double(now() - readyWaitStart_) / SYSCLOCK_ARM11); return true; }
++        return false;
++    }
++    // Host: go when every guest has loaded (one that left is not waited for).
++    bool all = true;
++    for (unsigned r = 1; r < rosterCount_; ++r) { const unsigned s = rosterSlot_[r]; if (s != NoSlot && !ready_[s] && guestAlive(s)) all = false; }
++    if (!all && !timedOut) return false;
++    const Header go = header(Type::Go);
++    for (int i = 0; i < 3; ++i) send(&go, sizeof go);
++    goSentAt_ = now(); goRepeats_ = 8; // repeated a few times early in the race, in case one is lost
++    log("all loaded after %.1f s: go", double(now() - readyWaitStart_) / SYSCLOCK_ARM11);
++    return true;
++}
++
++void applyRemotes() {
++    using namespace Kinoko;
++    poll();
++    auto* objects = Kart::KartObjectManager::Instance(); auto* pads = System::KPadDirector::Instance();
++    if (!objects || !pads) return;
++    // Someone left mid-race. A guest that went quiet becomes a CPU the host drives (for
++    // everyone); if the host went quiet, a guest drives every other kart itself.
++    if ((role_ == Role::Host && goSentAt_) || (role_ == Role::Guest && go_)) {
++        if (role_ == Role::Host) {
++            for (unsigned r = 1; r < rosterCount_; ++r) {
++                const u8 slot = rosterSlot_[r];
++                if (slot == NoSlot || slot >= MaxSlots || now() - guestLastRecv_[slot] < ms(2500)) continue;
++                rosterSlot_[r] = NoSlot; rosterName_[r].fill(0);
++                log("racer %u (guest %u) left: a CPU drives it now", r, slot);
++            }
++        } else if (!hostLost_ && now() - hostLastRecv_ > ms(2500)) { hostLost_ = true; log("host left mid-race: driving the other karts here"); }
++    }
++    for (unsigned i = 1; i < rosterCount_; ++i) {
++        if (ownsRacer(i)) continue;
++        const Remote& r = remotes_[indexRacer_[i]];
++        Kart::KartObject* kart = objects->object(i);
++        auto* pad = pads->hostController(i);
++        // No news for 0.6 s: let the kart coast with no inputs.
++        if (!r.have || now() - r.arrival > ms(600)) { pad->setInputsRawStick(0, 7, 7, System::Trick::None); continue; }
++        const KartState& k = r.k;
++        pad->setInputsRawStick(k.buttons, k.stickTrick & 15, 7, System::Trick(k.stickTrick >> 4));
++        // Where that kart is now: its last state, moved on by the ticks since it was sent.
++        const float dt = float(std::clamp<int>(int(localTick_) - int(k.tick) - r.minOffset, 0, 20));
++        const EGG::Vector3f vel(k.vel[0] / 64.f, k.vel[1] / 64.f, k.vel[2] / 64.f);
++        const EGG::Vector3f target = EGG::Vector3f(k.pos[0], k.pos[1], k.pos[2]) + vel * dt;
++        EGG::Quatf rot(k.rot[3] / 32767.f, k.rot[0] / 32767.f, k.rot[1] / 32767.f, k.rot[2] / 32767.f);
++        rot.normalise();
++        // The kart already drives itself from the same inputs; only its error is
++        // taken out, a little each tick, so speed and steering stay smooth.
++        const EGG::Vector3f current = kart->pos();
++        const EGG::Vector3f error = target - current;
++        if (error.length() > 1000.f) { kart->setPos(target); kart->setRot(rot); kart->move()->setSpeed(k.speed / 64.f); continue; }
++        kart->setPos(current + error * 0.12f);
++        kart->setRot(kart->fullRot().slerpTo(rot, 0.15f));
++        const float speed = kart->move()->speed();
++        kart->move()->setSpeed(speed + (k.speed / 64.f - speed) * 0.1f);
++    }
++}
++
++namespace {
++KartState stateOf(unsigned index, Kinoko::Kart::KartObject* kart, unsigned buttons, unsigned stickRaw, unsigned trick, bool finished) {
++    const auto& pos = kart->pos(); const auto& rot = kart->fullRot();
++    KartState k{};
++    k.racer = indexRacer_[index]; k.buttons = u8(buttons); k.stickTrick = u8((stickRaw & 15) | ((trick & 15) << 4));
++    k.flags = u8((finished ? 1 : 0) | itemBits_[index] << 1); itemBits_[index] = 0;
++    k.tick = localTick_;
++    k.pos[0] = pos.x; k.pos[1] = pos.y; k.pos[2] = pos.z;
++    const float here[3] = {pos.x, pos.y, pos.z};
++    for (int a = 0; a < 3; ++a) k.vel[a] = pack(here[a] - prevPos_[index][a], 64.f);
++    k.rot[0] = pack(rot.v.x, 32767.f); k.rot[1] = pack(rot.v.y, 32767.f); k.rot[2] = pack(rot.v.z, 32767.f); k.rot[3] = pack(rot.w, 32767.f);
++    k.speed = pack(kart->move()->speed(), 64.f);
++    return k;
++}
++void rememberPositions() {
++    using namespace Kinoko;
++    auto* objects = Kart::KartObjectManager::Instance(); if (!objects) return;
++    for (unsigned i = 0; i < rosterCount_; ++i) if (ownsRacer(i)) { const auto& p = objects->object(i)->pos(); prevPos_[i] = {p.x, p.y, p.z}; }
++    havePrev_ = true;
++}
++}
++
++void sendLocal(Kinoko::Kart::KartObject* kart, unsigned buttons, unsigned stickRaw, unsigned trick, bool finished) {
++    using namespace Kinoko;
++    ++localTick_;
++    if (!inRace_) return;
++    if (role_ == Role::Host && goRepeats_ && now() - goSentAt_ > ms(250)) { --goRepeats_; goSentAt_ = now(); sendSimple(Type::Go); }
++    if (!havePrev_) rememberPositions();
++    if (localTick_ % SendEvery) {
++        // Velocity is measured over the last tick before each update.
++        if (localTick_ % SendEvery == SendEvery - 1) rememberPositions();
++        return;
++    }
++    const KartState mine = stateOf(0, kart, buttons, stickRaw, trick, finished);
++    if (role_ == Role::Guest) {
++        StatePacket p; p.h = header(Type::State); p.k = mine;
++        send(&p, sizeof p);
++        return;
++    }
++    // Host: one packet with every kart: its own, each guest's latest and its CPUs.
++    BundlePacket b; unsigned n = 0;
++    b.k[n++] = mine;
++    auto* objects = Kart::KartObjectManager::Instance(); auto* pads = System::KPadDirector::Instance(); auto* race = System::RaceManager::Instance();
++    for (unsigned i = 1; i < rosterCount_ && n < MaxRacers; ++i) {
++        const unsigned racer = indexRacer_[i];
++        if (isCpu(racer)) {
++            if (!objects || !pads || !race) continue;
++            const auto& in = pads->hostController(i)->raceInputState();
++            const unsigned stick = unsigned(std::clamp<long>(std::lround(in.stick.x * 7.f) + 7, 0, 14));
++            b.k[n++] = stateOf(i, objects->object(i), in.buttons, stick, unsigned(in.trick), race->player(i).finished());
++            continue;
++        }
++        const Remote& r = remotes_[racer];
++        if (r.have && now() - r.arrival < ms(600)) b.k[n++] = r.k;
++    }
++    b.h = header(Type::Bundle, u8(n));
++    send(&b, sizeof(Header) + n * sizeof(KartState));
++}
++
++void endRace() {
++    if (inRace_) log("race %u ends", raceId_);
++    inRace_ = false; go_ = false; raceOver_ = false;
++    logHold_ = false; flushLog();
++}
++
++void hostRaceOver() {
++    if (role_ != Role::Host || !inRace_) return;
++    const Header h = header(Type::RaceOver);
++    for (int i = 0; i < 4; ++i) send(&h, sizeof h);
++}
++void hostLobbyGo() {
++    if (role_ != Role::Host || inRace_) return;
++    const Header h = header(Type::LobbyGo);
++    for (int i = 0; i < 3; ++i) send(&h, sizeof h);
++}
++bool takeLobbyGo() { const bool go = lobbyGo_; lobbyGo_ = false; return go; }
++bool takeRaceOver() { const bool over = raceOver_; raceOver_ = false; return over; }
++
++bool popItemNews(ItemNews& out) {
++    if (!newsCount_) return false;
++    out = news_[newsHead_]; newsHead_ = (newsHead_ + 1) % news_.size(); --newsCount_;
++    return true;
++}
++void sendItemGot(unsigned racer, uint8_t item) {
++    if (!inRace_ || !ownsRacer(racer)) return;
++    NetEvent e{}; e.kind = ItemNews::Got; e.item = item; e.owner = 0xff; e.action = -1;
++    sendEvent(racer, e);
++}
++void sendHit(unsigned racer, int8_t action, unsigned ownerIndex, uint8_t item, const float direction[3], const float position[3]) {
++    if (!inRace_ || !ownsRacer(racer)) return;
++    NetEvent e{}; e.kind = ItemNews::Hit; e.item = item; e.action = action;
++    e.owner = ownerIndex < rosterCount_ ? indexRacer_[ownerIndex] : 0xff;
++    for (int a = 0; a < 3; ++a) { e.direction[a] = direction[a]; e.position[a] = position[a]; }
++    sendEvent(racer, e);
++}
++void sendThrow(unsigned racer, uint8_t item, const float position[3], const float velocity[3], const float flight[3], float speed, unsigned targetIndex, bool backwards) {
++    if (!inRace_ || !ownsRacer(racer)) return;
++    NetEvent e{}; e.kind = ItemNews::Throw; e.item = item; e.action = backwards ? 1 : 0;
++    e.owner = targetIndex < rosterCount_ ? indexRacer_[targetIndex] : 0xff;
++    for (int a = 0; a < 3; ++a) { e.direction[a] = velocity[a]; e.position[a] = position[a]; e.flight[a] = flight[a]; }
++    e.speed = speed;
++    sendEvent(racer, e);
++}
++void setItemInput(unsigned racer, bool use, bool backwards, bool forwards) {
++    if (racer >= MaxRacers) return;
++    // A tap shorter than an update interval still arrives (held for at least one
++    // interval); the stick direction is the latest.
++    itemBits_[racer] = u8((itemBits_[racer] & 1) | (use ? 1 : 0) | (backwards ? 2 : 0) | (forwards ? 4 : 0));
++}
++void remoteItemInput(unsigned index, bool& use, bool& backwards, bool& forwards) {
++    use = backwards = forwards = false;
++    if (!inRace_ || index == 0 || index >= rosterCount_ || ownsRacer(index)) return;
++    const Remote& r = remotes_[indexRacer_[index]];
++    if (!r.have || now() - r.arrival > ms(600)) return;
++    use = r.k.flags & 2; backwards = r.k.flags & 4; forwards = r.k.flags & 8;
++}
++
++void debugLine(char* out, unsigned size) {
++    if (!size) return;
++    out[0] = 0;
++    if (role_ == Role::None) return;
++    unsigned live = 0, worstAge = 0;
++    for (unsigned i = 1; i < rosterCount_ && inRace_; ++i) {
++        if (ownsRacer(i)) continue;
++        const Remote& r = remotes_[indexRacer_[i]];
++        if (!r.have) continue;
++        ++live; worstAge = std::max(worstAge, toMs(now() - r.arrival));
++    }
++    snprintf(out, size, "%s P%u %s n%u live%u age%u rtt%u/%u tx%u f%u rx%u b%u",
++             role_ == Role::Host ? "H" : "G", mySlot_ + 1, inRace_ ? "IN" : "--", inRace_ ? rosterCount_ : 0, live, worstAge,
++             rttMs_, rttMinMs_ == ~0u ? 0u : rttMinMs_, sent_, sendFails_, received_, maxBatch_);
++}
++} // namespace mkw::net
+diff --git a/src/race_grid.cpp b/src/race_grid.cpp
+index 9be5227..9ab1eab 100755
+--- a/src/race_grid.cpp
++++ b/src/race_grid.cpp
+@@ -250,7 +250,7 @@ void RaceGrid::beforeStep(uint16_t bulletPlayers){
+     for(unsigned j=1;j<count_;++j)leaderCompletion=std::max(leaderCompletion,manager->player(j).raceCompletion());
+     // Retail Enemy::AI drives every CPU outside a Bullet (and player zero for QA).
+     uint32_t aiMask=0;
+-    for(unsigned i=0;i<count_;++i)if(!(bulletPlayers&(1u<<i))&&(i||driveLocal))aiMask|=1u<<i;
++    for(unsigned i=0;i<count_;++i)if(!(bulletPlayers&(1u<<i))&&(i||driveLocal)&&!(externalMask&(1u<<i)))aiMask|=1u<<i;
+     if(ai_.ready()){
+         // CPUs run the retail stuck handler inside CpuAi; the QA autopilot keeps
+         // the adapted recovery below.
+@@ -268,6 +268,7 @@ void RaceGrid::beforeStep(uint16_t bulletPlayers){
+             d.bulletGravity.reset();kart->move()->setBulletRouteFlight(false,EGG::Vector3f::ey);kart->move()->setBulletGroundContact(false);
+         };
+         if(d.bullet&&!bullet)releaseBulletGravity();
++        if(externalMask&(1u<<i))continue; // netplay: inputs set by mkw::net::applyRemote
+         if(i==0&&!bullet&&!driveLocal){if(d.bullet)kart->move()->setKartSpeedLimit();d.bullet=false;continue;}
+         auto* pad=System::KPadDirector::Instance()->hostController(i);
+         const auto& route=bullet?bulletRoute_:route_;
+diff --git a/src/race_hud.cpp b/src/race_hud.cpp
+index 902f1cd..b480335 100755
+--- a/src/race_hud.cpp
++++ b/src/race_hud.cpp
+@@ -2,6 +2,7 @@
+ #include <mkw/render_quality.hpp>
+ #include <mkw/hud_feedback.hpp>
+ #include <mkw/race_hud.hpp>
++#include <mkw/netplay.hpp>
+ #include <mkw/battle_hud_assets.hpp>
+ #include <mkw/battle_hud_motion.hpp>
+ #include <mkw/coin_hud_camera.hpp>
+@@ -31,6 +32,7 @@
+ #include <cstdio>
+ #include <cstring>
+ namespace mkw {
++char raceHudPerfLine[320]{};
+ namespace {
+ // Retail itembox / itemBoxNise materials (layout generated from the BRRES).
+ struct BoxMaterial { Renderer* renderer; const Model* model; const ItemBoxLayout* layout;
+@@ -170,7 +172,24 @@ void fakeBoxTransform(C3D_Mtx& t,Vec3 p,Vec3 scale,unsigned counter){
+     Mtx_Scale(&t,.4f*scale.x,.4f*scale.y,.4f*scale.z);
+ }
+ }
++// Local wireless: player names on the name balloons, spelled from the menu's native-font
++// name glyphs (one small texture per character, loaded at race start for the names used).
++namespace {
++struct NameGlyphRow { const char* key; const char* path; float w, h, u, v; const char* text; int a, b; unsigned size; };
++const NameGlyphRow kNameGlyphRows[] = {
++#include <mkw/menu_name_glyphs.hpp>
++};
++const NameGlyphRow* nameGlyphRow(uint16_t code) {
++    char key[24]; std::snprintf(key, sizeof key, "name_glyph_%04x", unsigned(code));
++    for (const auto& row : kNameGlyphRows) if (!std::strcmp(row.key, key)) return &row;
++    return nullptr;
++}
++}
+ struct RaceHud::Impl {
++    static constexpr unsigned MaxNameGlyphs=48;
++    std::array<Texture,MaxNameGlyphs> nameGlyphs;std::array<uint16_t,MaxNameGlyphs> nameGlyphCodes{};
++    std::array<const NameGlyphRow*,MaxNameGlyphs> nameGlyphRows{};unsigned nameGlyphCount=0;
++    int nameGlyph(uint16_t code)const{for(unsigned i=0;i<nameGlyphCount;++i)if(nameGlyphCodes[i]==code)return int(i);return -1;}
+     std::array<std::unique_ptr<Model>,21> models,staticModels;
+     std::array<std::unique_ptr<Model>,2> itemShadows;
+     std::array<Vec3,12> bulletUp{};
+@@ -317,6 +336,15 @@ bool RaceHud::load(){
+     for(unsigned i=0;i<10;++i)valid&=impl_->digits[i].load(HudDigits[i].path);
+     for(unsigned i=0;i<HudExtraCount;++i)valid&=impl_->extras[i].load(HudExtras[i].path);
+     for(unsigned i=0;i<BalloonNames.size();++i)valid&=impl_->names[i].load(BalloonNames[i].path);
++    // Player names of a shared race: their glyphs (a missing one is skipped, never fatal).
++    impl_->nameGlyphCount=0;
++    for(unsigned racer=0;racer<12;++racer)if(const uint16_t* name=mkw::net::nameFor(racer))
++        for(unsigned c=0;c<10&&name[c];++c){
++            auto& n=*impl_;if(n.nameGlyph(name[c])>=0||n.nameGlyphCount>=Impl::MaxNameGlyphs)continue;
++            const auto* row=nameGlyphRow(name[c]);if(!row)continue;
++            if(!n.nameGlyphs[n.nameGlyphCount].load(row->path))continue;
++            n.nameGlyphCodes[n.nameGlyphCount]=name[c];n.nameGlyphRows[n.nameGlyphCount]=row;++n.nameGlyphCount;
++        }
+     valid&=impl_->balloonLine.load(BalloonLinePath);
+     if(battle){
+         impl_->battle.enabled=true;
+@@ -777,6 +805,16 @@ void RaceHud::drawOverlay(Renderer& renderer,const RaceItems& items,unsigned sta
+             // Original chara_name_only_text_color_{red,blue} C1 values.
+             const unsigned team=scenario.teams?scenario.players[b.shown].team:2;
+             const uint32_t color=team==0?0xff4646ffu:team==1?0x463cffffu:0xffffffffu;
++            // A player in a shared race: their name, right-aligned like the character name.
++            if(const uint16_t* name=mkw::net::nameFor(unsigned(b.shown));name&&impl_->nameGlyphCount){
++                const float gh=th*1.25f;float total=0;
++                for(unsigned c=0;c<10&&name[c];++c){const int g=impl_->nameGlyph(name[c]);if(g>=0)total+=gh*impl_->nameGlyphRows[g]->w/impl_->nameGlyphRows[g]->h;}
++                float x=right-total;
++                for(unsigned c=0;c<10&&name[c];++c){const int g=impl_->nameGlyph(name[c]);if(g<0)continue;const auto* row=impl_->nameGlyphRows[g];
++                    const float gw=gh*row->w/row->h;
++                    renderer.drawScreenSpriteRegion(impl_->nameGlyphs[g],x,cy-gh*.5f,gw,gh,0,0,row->u,row->v,b.alpha,color);x+=gw;}
++                continue;
++            }
+             renderer.drawScreenSpriteRegion(impl_->names[character],right-tw,cy-th*.5f,tw,th,0,0,n.u,n.v,b.alpha,color);
+         }
+     }
+@@ -888,6 +926,12 @@ void RaceHud::drawOverlay(Renderer& renderer,const RaceItems& items,unsigned sta
+         for(int i=0;i<n;++i){const unsigned d=unsigned(text[i]-'0');gold(impl_->digits[d],HudDigits[d],{Right-Size-float(n-1-i)*Advance,Top+lift,Size,Size});}
+         renderer.drawScreenText("KM/H",Right-26,Top+Size+3+lift,1.f,0xffffffffu);
+     }
++    if(speedometer){   // Local wireless: link statistics, top left, with the speedometer (SELECT).
++        char line[96];mkw::net::debugLine(line,sizeof line);
++        if(!std::strncmp(raceHudPerfLine,"GPU ",4))line[0]=0; // GPU profile line only
++        if(line[0])renderer.drawScreenText(line,4,4,1.f,0xffff40ffu);
++        if(raceHudPerfLine[0])renderer.drawScreenText(raceHudPerfLine,4,line[0]?14:4,1.f,0x80ffffffu);
++    }
+     if(!impl_->battle.enabled){
+     rank=std::clamp(rank,1u,12u);
+     auto& rs=impl_->rankSpin;
+diff --git a/src/race_items.cpp b/src/race_items.cpp
+index aee1da1..44d2102 100755
+--- a/src/race_items.cpp
++++ b/src/race_items.cpp
+@@ -198,6 +198,7 @@ int RaceItems::targetAhead(unsigned player,bool leader) const{
+ 
+ bool RaceItems::strike(unsigned player,int action,unsigned owner,Vec3 direction,bool force,ItemKind item){
+     if(player>=count_||action<0)return false;
++    if((remoteMask&(1u<<player))&&!netStrike_)return false; // their own console decides
+     const int started=karts_->startAction(player,action,force,owner,direction);
+     // RMCU: the start function reports item loss to the holder at once.
+     applyLoss(player,karts_->takeLoss(player));
+@@ -723,3 +724,64 @@ void RaceItems::afterStep(const ItemRacer* racers,unsigned count,ItemWorldQuery
+     stepSounds_=sounds_.size();
+ }
+ }
++
++namespace mkw {
++void RaceItems::netGive(unsigned player,ItemKind kind){
++    if(player>=count_||unsigned(kind)>=19)return;
++    auto& h=hud_[player];
++    // Replace whatever this console thought it held: the owner's console is right.
++    h.roulette=0;rouletteChoice_[player]=ItemKind::None;roulettes_[player]={};
++    if(h.item!=ItemKind::None&&h.item!=ItemKind::ThunderCloud){h.item=ItemKind::None;h.charges=0;}
++    give(player,kind);
++}
++void RaceItems::netStrike(unsigned player,int action,unsigned owner,Vec3 direction,ItemKind item,Vec3 position){
++    if(player>=count_)return;
++    const bool object=item==ItemKind::GreenShell||item==ItemKind::RedShell||item==ItemKind::BlueShell||
++        item==ItemKind::Banana||item==ItemKind::FakeBox||item==ItemKind::Bobomb;
++    if(object){
++        // The item that hit: the nearest live one of that kind.
++        ItemActor* best=nullptr;float bestD=900.f*900.f;
++        for(auto& a:actors_){
++            if(!a.active||a.explosion||a.kind!=item)continue;
++            const Vec3 d=a.position-position;const float dd=dot(d,d);
++            if(dd<bestD){bestD=dd;best=&a;}
++        }
++        if(best){
++            if(blastItem(best->kind))explode(*best);
++            else{best->active=false;sound(ItemSoundCue::Hit,*best);
++                events_.push_back({ItemEffect::Break,uint8_t(best->owner<0?0xff:best->owner),uint16_t(best->kind),best->position,-1,best->scale});}
++        }else if(owner<count_){
++            // Not thrown: an item the owner was dragging behind.
++            auto& h=hud_[owner];
++            if(h.deployed&&baseKind(h.heldKind)==item)for(int slot=2;slot>=0;--slot)if(h.heldMask&(1u<<slot)){destroyHeld(owner,unsigned(slot));break;}
++        }
++    }
++    if(action<0)return;
++    netStrike_=true;strike(player,action,owner,direction,false,item);netStrike_=false;
++}
++}
++namespace mkw {
++bool RaceItems::applyNetThrow(const NetThrow& t){
++    ItemActor* best=nullptr;
++    for(auto& a:actors_)if(a.active&&!a.netFixed&&!a.explosion&&a.owner==int8_t(t.player)&&a.kind==t.kind&&a.age<90&&(!best||a.age<best->age))best=&a;
++    if(!best)return false;
++    auto& a=*best;const float age=float(a.age);
++    a.position=t.position+t.velocity*age;a.previous=a.position;a.velocity=t.velocity;
++    a.flightDirection=t.flight;a.travelSpeed=t.speed;a.backwards=t.backwards;
++    a.yaw=std::atan2(t.flight.x,t.flight.z);
++    if(t.target>=0&&unsigned(t.target)<count_)a.target=int8_t(t.target);
++    a.netFixed=true;return true;
++}
++void RaceItems::netThrow(unsigned player,ItemKind kind,Vec3 position,Vec3 velocity,Vec3 flight,float speed,int target,bool backwards){
++    if(player>=count_)return;
++    NetThrow t;t.used=true;t.player=player;t.kind=kind;t.position=position;t.velocity=velocity;t.flight=flight;t.speed=speed;t.target=target;t.backwards=backwards;t.ttl=30;
++    if(applyNetThrow(t))return;
++    for(auto& slot:netThrows_)if(!slot.used){slot=t;return;}
++}
++void RaceItems::netTick(){
++    for(auto& t:netThrows_){
++        if(!t.used)continue;
++        if(applyNetThrow(t)||!--t.ttl)t.used=false;
++    }
++}
++}
+diff --git a/src/racer_visuals.cpp b/src/racer_visuals.cpp
+index 414476a..b8aa8a1 100644
+--- a/src/racer_visuals.cpp
++++ b/src/racer_visuals.cpp
+@@ -180,7 +180,8 @@ void RacerVisuals::Impl::prepareRacer(unsigned i){
+     if(dot(position-frame.viewer,position-frame.viewer)>25000.f*25000.f)return;
+     const auto& quality=renderQuality();const Vec3 camera=frame.camera;
+     const float lodScale=std::max(.01f,r->vehicle.maxScale());
+-    out.lod=r->lod.update(dot(position-camera,position-camera)/(lodScale*lodScale),frame.fov,frame.fullDetail||!r->driverLod||!r->bodyLod||!r->bodyLodRear||(VehicleLodLayout[r->choice->vehicle].handle&&(!r->handleLod||!r->handleLodRear)));
++    const float lodDistance=std::max(.1f,renderQuality().racerLodDistance);
++    out.lod=r->lod.update(dot(position-camera,position-camera)/(lodScale*lodScale*lodDistance*lodDistance),frame.fov,frame.fullDetail||!r->driverLod||!r->bodyLod||!r->bodyLodRear||(VehicleLodLayout[r->choice->vehicle].handle&&(!r->handleLod||!r->handleLodRear)));
+     if(r->lowOnly)out.lod=std::max(out.lod,2u);
+     // Reduced detail: parts too small to see are neither posed nor drawn.
+     auto tiny=[&](const Model& model,const C3D_Mtx& matrix){return quality.tooSmall({model.minimum,model.maximum},matrix,camera);};
+diff --git a/src/render_thread.cpp b/src/render_thread.cpp
+index ef65b05..7e7cbde 100755
+--- a/src/render_thread.cpp
++++ b/src/render_thread.cpp
+@@ -56,7 +56,7 @@ enum : uint16_t {
+     CmdBegin=1,CmdEnd,CmdProjection,CmdCourseLighting,CmdRetailFog,CmdRequestBloom,CmdApplyBloom,CmdBottom,
+     CmdDraw,CmdDrawAtScreen,CmdMenuIcon,CmdEnvironmentUv,CmdUv1,CmdUvOffset,CmdClearEnvironment,
+     CmdRigid,CmdSkin,CmdOverrides,CmdShadows,CmdSparks,CmdEffects,CmdSceneEffects,CmdCinema,CmdFade,CmdSprite,CmdFontSprite,
+-    CmdMaterialQuads,CmdText,CmdScreenDepth,CmdMenuModelLayer,CmdIntroWorldEnd,CmdRequestStadium,CmdCoinHudModel,CmdPlayerShadow,CmdSceneRegion,CmdShadowUnion,
++    CmdMaterialQuads,CmdText,CmdScreenDepth,CmdCategory,CmdMenuModelLayer,CmdIntroWorldEnd,CmdRequestStadium,CmdCoinHudModel,CmdPlayerShadow,CmdSceneRegion,CmdShadowUnion,
+ };
+ // begun: C3D_FrameBegin already ran on the recording thread (stereo immediate frames).
+ struct ShadowUnionCommand {static constexpr uint16_t Type=CmdShadowUnion;bool active;};
+@@ -114,6 +114,7 @@ struct MaterialQuadsCommand {
+ };
+ struct TextCommand {static constexpr uint16_t Type=CmdText;const char* text;float x,y,size;uint32_t rgba;};
+ struct ScreenDepthCommand {static constexpr uint16_t Type=CmdScreenDepth;float parallax;};
++struct CategoryCommand {static constexpr uint16_t Type=CmdCategory;uint16_t k;};
+ }
+ 
+ struct DeferredWrites::Storage {
+@@ -315,7 +316,10 @@ void Renderer::execute(FrameList& list){
+         case CmdDraw:{
+             const auto& c=*static_cast<const DrawCommand*>(body);
+             execFrame_=c.frame;execAdditive_=c.additive;
+-            drawNow(*c.model,c.vertices,c.transform,c.backdrop,c.material,c.context,c.visible);break;
++            drawNow(*c.model,c.vertices,c.transform,c.backdrop,c.material,c.context,c.visible);
++            if(stats_.drawCalls<lastKick_)lastKick_=0;
++            if(stats_.drawCalls-lastKick_>=KickEvery)kickGpu();
++            break;
+         }
+         case CmdDrawAtScreen:{
+             const auto& c=*static_cast<const DrawAtScreenCommand*>(body);
+@@ -366,6 +370,7 @@ void Renderer::execute(FrameList& list){
+         }
+         case CmdText:{const auto& c=*static_cast<const TextCommand*>(body);drawScreenText(c.text,c.x,c.y,c.size,c.rgba);break;}
+         case CmdScreenDepth:screenDepthNow(static_cast<const ScreenDepthCommand*>(body)->parallax);break;
++        case CmdCategory:endCategoryNow(static_cast<const CategoryCommand*>(body)->k);break;
+         }
+     }
+     }
+@@ -531,7 +536,7 @@ void Renderer::end(){
+     submit();
+     // The last frame the render thread finished (one frame behind).
+     LightLock_Lock(&publishLock_);const Stats s=published_;LightLock_Unlock(&publishLock_);
+-    triangles=s.triangles;drawCalls=s.drawCalls;culledTriangles=s.culledTriangles;culledSubmeshes=s.culledSubmeshes;
++    triangles=s.triangles;drawCalls=s.drawCalls;culledTriangles=s.culledTriangles;culledSubmeshes=s.culledSubmeshes;categoryDraws=s.categories;gpuCategoryMs=s.gpuCategoryMs;
+     previousGpuMs=s.previousGpuMs;beginWaitMs=s.beginWaitMs;commandUsage=s.commandUsage;renderThreadMs=s.renderMs;
+     renderMetrics.flushCalls+=s.metrics.flushCalls;renderMetrics.flushBytes+=s.metrics.flushBytes;
+     renderMetrics.skinnedVertices+=s.metrics.skinnedVertices;
+@@ -796,3 +801,42 @@ namespace mkw { void Renderer::setShadowUnion(bool active){
+  if(!recording()){shadowUnionNow(active);return;}
+  command<ShadowUnionCommand>().active=active;
+ } }
++namespace mkw {
++void Renderer::endCategory(unsigned k){
++    if(recording()){command<CategoryCommand>().k=uint16_t(k);return;}
++    endCategoryNow(k);
++}
++// citro3d's context starts with its gxCmdQueue_s (source/internal.h), 32 entries.
++extern "C" gxCmdQueue_s __C3D_Context;
++void Renderer::endCategoryNow(unsigned k){
++    if(k<stats_.categories.size())stats_.categories[k]=uint16_t(stats_.categories[k]+stats_.drawCalls-stats_.categoryMark);
++    // Start the GPU on what is recorded so far (citro3d otherwise runs nothing
++    // until C3D_FrameEnd, leaving the GPU idle while this thread replays).
++    if(gpuProfile&&!eye_&&!bottomWorldPass_){
++        // Diagnostics: run what is recorded and wait for it; the GPU time of this
++        // category is from the previous category's completion to this one's.
++        gxCmdQueue_s& queue=__C3D_Context;
++        if(queue.maxEntries>=32&&queue.numEntries<20){
++            // The GPU is idle here (the previous category was waited for): time
++            // only this category's submitted work, not this thread's recording.
++            C3D_FrameSplit(GX_CMDLIST_FLUSH);
++            const uint64_t start=svcGetSystemTick();
++            gxCmdQueueRun(&queue);
++            gxCmdQueueWait(&queue,-1);
++            if(k<stats_.gpuCategoryMs.size())stats_.gpuCategoryMs[k]+=float((svcGetSystemTick()-start)*1000.0/SYSCLOCK_ARM11);
++        }
++    }else if(stats_.drawCalls!=stats_.categoryMark)kickGpu();
++    stats_.categoryMark=stats_.drawCalls;
++}
++void Renderer::kickGpu(){
++    if(!earlyGpuStart)return;
++    gxCmdQueue_s& queue=__C3D_Context;
++    // Every split takes a queue entry until the next C3D_FrameBegin; keep room
++    // for the frame's own splits (bloom, shadows) and its end + 3 transfers.
++    if(queue.maxEntries<32||queue.numEntries>=16)return;
++    lastKick_=stats_.drawCalls;
++    C3D_FrameSplit(GX_CMDLIST_FLUSH);
++    // Once running, later list submissions start on their own (gxCmdQueueAdd).
++    gxCmdQueueRun(&queue);
++}
++}
+diff --git a/src/renderer.cpp b/src/renderer.cpp
+index bf57609..0249e7c 100755
+--- a/src/renderer.cpp
++++ b/src/renderer.cpp
+@@ -337,7 +337,7 @@ void Model::freezeLighting(const float* palette,unsigned stride){
+     }
+     flushGpuData(vertices,vertexCount*sizeof(Vertex));
+ }
+-Model::~Model() { if(staticEnvironment2)linearFree(staticEnvironment2); for(auto* p:regionIndices)if(p)linearFree(p);if(contactIndices)linearFree(contactIndices);if(vertices)linearFree(vertices);if(indices)linearFree(indices);if(skinBoneIndices)linearFree(skinBoneIndices); }
++Model::~Model() { if(gpuVertices)vramFree(gpuVertices);if(gpuIndices)vramFree(gpuIndices); if(staticEnvironment2)linearFree(staticEnvironment2); for(auto* p:regionIndices)if(p)linearFree(p);if(contactIndices)linearFree(contactIndices);if(vertices)linearFree(vertices);if(indices)linearFree(indices);if(skinBoneIndices)linearFree(skinBoneIndices); }
+ bool Model::load(const char* path,bool dynamicLighting) {
+     // Menu models come from the open menu.pak (one seek+read). Others stream
+     // large payloads straight into LINEAR memory; a 32 KiB stdio buffer
+@@ -670,6 +670,20 @@ bool Renderer::loadVramTexture(Texture& texture,const char* path,GPU_TEXTURE_WRA
+     texture.ready=true;
+     return true;
+ }
++std::size_t Model::moveGeometryToVram(std::size_t reserve){
++    if(gpuVertices||!vertices||!indices||!vertexCount||!indexCount||skinBoneIndices)return 0;
++    const std::size_t vb=(std::size_t(vertexCount)*sizeof(Vertex)+15)&~std::size_t(15);
++    const std::size_t ib=(std::size_t(indexCount)*sizeof(uint16_t)+15)&~std::size_t(15);
++    if(vramSpaceFree()<vb+ib+reserve)return 0;
++    auto* v=static_cast<Vertex*>(vramAlloc(vb));
++    auto* i=v?static_cast<uint16_t*>(vramAlloc(ib)):nullptr;
++    if(!v||!i){if(v)vramFree(v);return 0;}
++    flushGpuData(vertices,uint32_t(vertexCount*sizeof(Vertex)));flushGpuData(indices,uint32_t(indexCount*sizeof(uint16_t)));
++    C3D_SyncTextureCopy(reinterpret_cast<u32*>(vertices),0,reinterpret_cast<u32*>(v),0,u32(vb),8);
++    C3D_SyncTextureCopy(reinterpret_cast<u32*>(indices),0,reinterpret_cast<u32*>(i),0,u32(ib),8);
++    gpuVertices=v;gpuIndices=i;
++    return vb+ib;
++}
+ bool Renderer::moveToVram(Texture& texture,std::size_t reserve){
+     auto& t=texture.gpu;
+     const u32 at=reinterpret_cast<u32>(t.data);
+@@ -882,7 +896,8 @@ void Renderer::beginFrame(){
+     for(int i=0;i<6;++i)C3D_TexEnvInit(C3D_GetTexEnv(i));
+     auto* env=C3D_GetTexEnv(0);C3D_TexEnvSrc(env,C3D_Both,GPU_TEXTURE0,GPU_PRIMARY_COLOR);C3D_TexEnvFunc(env,C3D_Both,GPU_MODULATE);
+     C3D_DepthTest(true,GPU_GEQUAL,GPU_WRITE_ALL);C3D_AlphaBlend(GPU_BLEND_ADD,GPU_BLEND_ADD,GPU_SRC_ALPHA,GPU_ONE_MINUS_SRC_ALPHA,GPU_ONE,GPU_ONE_MINUS_SRC_ALPHA);
+-    if(!eye_&&!bottomWorldPass_)stats_.triangles=stats_.drawCalls=stats_.culledTriangles=stats_.culledSubmeshes=0;
++    if(!eye_&&!bottomWorldPass_){stats_.triangles=stats_.drawCalls=stats_.culledTriangles=stats_.culledSubmeshes=0;stats_.categories={};stats_.gpuCategoryMs={};stats_.gpuMark=0;}
++    stats_.categoryMark=stats_.drawCalls;
+ }
+ C3D_Mtx ViewFrustum::cameraFacing(Vec3 position,float scale) const {
+     C3D_Mtx transform;Mtx_Identity(&transform);
+@@ -1043,6 +1058,8 @@ void Renderer::resetMaterialUniforms(){
+     if(tintDirty_){C3D_FVUnifSet(GPU_VERTEX_SHADER,tintLoc_,1,1,1,1);tintDirty_=false;}
+ }
+ void Renderer::drawNow(const Model& model,const Vertex* vertices,const C3D_Mtx& transform,bool backdrop,MaterialBinder material,void* context,ShapeVisible visible){
++    // Diagnostics: vertex-only cost (geometry fully processed, 64 pixels drawn).
++    if(debugTinyScissor&&!bottomPass_)C3D_SetScissor(GPU_SCISSOR_NORMAL,0,0,8,8);
+     C3D_Mtx mv;Mtx_Multiply(&mv,&view_,&transform);
+     drawSampledLighting_=model.dynamicLightTextures;
+     ClipFrustum staticFrustum;
+@@ -1064,7 +1081,7 @@ void Renderer::drawNow(const Model& model,const Vertex* vertices,const C3D_Mtx&
+     if(!model.fixedLighting&&!model.staticLightingBaked)normalMatrixNow(mv);
+     auto* attr=C3D_GetAttrInfo();AttrInfo_Init(attr);
+     AttrInfo_AddLoader(attr,0,GPU_FLOAT,3);AttrInfo_AddLoader(attr,1,GPU_FLOAT,3);AttrInfo_AddLoader(attr,2,GPU_FLOAT,4);AttrInfo_AddLoader(attr,3,GPU_UNSIGNED_BYTE,4);
+-    auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,vertices,sizeof(Vertex),4,0x3210);
++    auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.drawVertices(vertices),sizeof(Vertex),4,0x3210);
+     if(model.staticEnvironment2){
+         // Buffer permutations address loader slots, not shader registers.
+         // This is loader slot 4 mapped to v5 (instaticuv); retain baked UVs.
+@@ -1081,7 +1098,7 @@ void Renderer::drawNow(const Model& model,const Vertex* vertices,const C3D_Mtx&
+     }
+     const int region=execSceneRegion_==1?0:execSceneRegion_==2?1:-1;
+     const bool regionCull=region>=0&&model.regionIndices[region]&&model.regionVisibility[region].size()==model.submeshes.size();
+-    const auto* drawIndices=regionCull?model.regionIndices[region]:model.indices;
++    const auto* drawIndices=regionCull?model.regionIndices[region]:model.drawIndices();
+     // One set of object-space planes per static model, shared by all ranges.
+     const bool cull=!backdrop&&!model.visibility.empty()&&model.visibility.size()==model.submeshes.size();
+     // Rigid parts (one bone each: a stand of Mii spectators spread over the
+@@ -1784,7 +1801,7 @@ void Renderer::drawNow(const Model& model,const Vertex* vertices,const C3D_Mtx&
+                     C3D_FVUnifSet(GPU_VERTEX_SHADER,envParamLoc_,std::cos(rigid_->environmentYaw),std::sin(rigid_->environmentYaw),1,0);
+                     C3D_BoolUnifSet(GPU_VERTEX_SHADER,environmentMappedLoc_,true);
+                 }
+-                C3D_DrawElements(GPU_TRIANGLES,part.count,C3D_UNSIGNED_SHORT,model.indices+part.first);
++                C3D_DrawElements(GPU_TRIANGLES,part.count,C3D_UNSIGNED_SHORT,model.drawIndices()+part.first);
+                 stats_.triangles+=part.count/3;++stats_.drawCalls;
+             }
+             if(environment){
+@@ -1836,7 +1853,7 @@ void Renderer::shadowVolumesNow(const ShadowVolume* volumes,unsigned count,float
+             const auto& v=volumes[i];if(!v.model||!v.model->indexCount)continue;
+             C3D_Mtx mv;Mtx_Multiply(&mv,&view_,&v.transform);C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER,modelViewLoc_,&mv);
+             auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,v.model->vertices,sizeof(Vertex),4,0x3210);
+-            C3D_DrawElements(GPU_TRIANGLES,v.model->indexCount,C3D_UNSIGNED_SHORT,v.model->indices);
++            C3D_DrawElements(GPU_TRIANGLES,v.model->indexCount,C3D_UNSIGNED_SHORT,v.model->drawIndices());
+             stats_.triangles+=v.model->indexCount/3;++stats_.drawCalls;
+         }
+     };
+@@ -2155,10 +2172,33 @@ void Renderer::effectListNow(const RaceEffects& effects,const ef::DrawList& list
+     C3D_TexEnvBufColor(0);
+     // Unit 0 in projection mode for projected layers; bound by pointer until the draw.
+     C3D_Tex projected{};
+-    for(const ef::DrawBatch& b:list.batches){
++    if(debugSkipEffects)return;
++    // Consecutive batches of the same emitter resource with identical draw state
++    // and adjacent vertices become one draw; a batch repeating the previous one's
++    // state skips its (identical) combiner/blend/texture setup.
++    auto sameState=[](const ef::DrawBatch& a,const ef::DrawBatch& b){
++        return a.res==b.res&&a.texture[0]==b.texture[0]&&a.texture[1]==b.texture[1]&&a.wrap[0]==b.wrap[0]&&a.wrap[1]==b.wrap[1]&&
++               a.cull==b.cull&&a.alphaRef0==b.alphaRef0&&a.alphaRef1==b.alphaRef1&&!std::memcmp(a.constant,b.constant,sizeof a.constant);
++    };
++    const ef::DrawBatch* applied=nullptr;
++    for(size_t bi=0;bi<list.batches.size();){
++        const ef::DrawBatch& b=list.batches[bi];
+         if(b.first>=vertexCount)break;
+-        const uint32_t count=ef::drawBatchVertexCount(b,vertexCount);
+-        if(!count)continue;
++        uint32_t count=ef::drawBatchVertexCount(b,vertexCount);
++        size_t next=bi+1;
++        if(!count){bi=next;continue;}
++        while(next<list.batches.size()){
++            const ef::DrawBatch& n=list.batches[next];
++            if(n.first!=b.first+count||!sameState(b,n))break;
++            const uint32_t more=ef::drawBatchVertexCount(n,vertexCount);
++            if(!more)break;
++            count+=more;++next;
++        }
++        bi=next;
++        if(applied&&sameState(*applied,b)){
++            C3D_DrawArrays(GPU_TRIANGLES,int(b.first),int(count));
++            stats_.triangles+=count/3;++stats_.drawCalls;continue;
++        }
+         const ef::Material& m=state.materials[b.res->index];
+         const ef::DrawSetting& d=b.res->desc.draw;
+         bool missing=false;
+@@ -2187,7 +2227,8 @@ void Renderer::effectListNow(const RaceEffects& effects,const ef::DrawList& list
+             }
+         }
+ #endif
+-        if(missing)continue;
++        if(missing){applied=nullptr;continue;}
++        applied=&b;
+         int rgbBuffer=0,alphaBuffer=0;
+         for(int i=0;i<6;++i){
+             C3D_TexEnv* env=C3D_GetTexEnv(i);C3D_TexEnvInit(env);
+diff --git a/src/renderer_player_shadow.cpp b/src/renderer_player_shadow.cpp
+index 53d069d..efc0d9e 100755
+--- a/src/renderer_player_shadow.cpp
++++ b/src/renderer_player_shadow.cpp
+@@ -286,7 +286,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+    C3D_Mtx mv;Mtx_Multiply(&mv,&lightView,&c.transform);C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER,modelViewLoc_,&mv);
+    auto* attr=C3D_GetAttrInfo();AttrInfo_Init(attr);
+    AttrInfo_AddLoader(attr,0,GPU_FLOAT,3);AttrInfo_AddLoader(attr,1,GPU_FLOAT,3);AttrInfo_AddLoader(attr,2,GPU_FLOAT,4);AttrInfo_AddLoader(attr,3,GPU_UNSIGNED_BYTE,4);
+-   auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.vertices,sizeof(Vertex),4,0x3210);
++   auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.drawVertices(model.vertices),sizeof(Vertex),4,0x3210);
+    const bool skin=c.palette&&c.bones<=MaxSkinBones;
+    const bool lit=skin&&model.skinBoneIndices&&!model.fixedLighting&&!model.staticLightingBaked;
+    if(lit){AttrInfo_AddLoader(attr,4,GPU_FLOAT,1);BufInfo_Add(buf,model.skinBoneIndices,sizeof(float),1,4);}
+@@ -308,7 +308,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+      C3D_TexEnvOpRgb(e,GPU_TEVOP_RGB_SRC_COLOR,GPU_TEVOP_RGB_SRC_ALPHA);
+      C3D_TexEnvFunc(e,C3D_RGB,GPU_MODULATE);
+     }
+-    C3D_DrawElements(GPU_TRIANGLES,end-first,C3D_UNSIGNED_SHORT,model.indices+first);
++    C3D_DrawElements(GPU_TRIANGLES,end-first,C3D_UNSIGNED_SHORT,model.drawIndices()+first);
+     stats_.triangles+=(end-first)/3;++stats_.drawCalls;
+    }
+   }
+@@ -317,6 +317,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+  // The original scene's depth/stencil stays intact across the auxiliary pass.
+  auto* target=bottomWorldPass_?bottomTarget_:(bloomFrame_||stadiumFrame_)?sceneTarget_:topTarget();
+  C3D_FrameDrawOn(target);
++ if(!actor)endCategoryNow(12); // GPU profile: player shadow capture
+  C3D_SetViewport(0,0,240,bottomWorldPass_?320:400);
+  C3D_SetScissor(GPU_SCISSOR_DISABLE,0,0,240,bottomWorldPass_?320:400);
+  C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER,projectionLoc_,&projection_);
+@@ -378,6 +379,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+  // Render-thread scratch: reuse capacity, rebuild for each projection/eye.
+  // Never reuse model pointers or visibility decisions across frames.
+  struct ReceiverRun {const Model* model;unsigned sub;IndexRange range;bool fade;};
++ constexpr unsigned ReceiverGapBridge=384; // indices (128 triangles)
+  static std::vector<ReceiverRun> receiverRuns;
+  bool receiversPrepared=false,contactPass=false;
+  const float viewDeterminant=view_.r[0].x*(view_.r[1].y*view_.r[2].z-view_.r[1].z*view_.r[2].y)
+@@ -402,6 +404,11 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+       if(!playerShadow::intersects(block.bounds.minimum,block.bounds.maximum,origin,radius)||
+          !shadowFrustum.intersects(block.bounds,lightMask)||!receiverView.intersects(block.bounds,viewMask)){submit();continue;}
+       auto append=[&](IndexRange indices){
++       // Bridge small gaps between visible blocks of one submesh: the extra
++       // triangles fall outside the light capture (alpha 0, discarded) and cost
++       // far less than another draw call per eye.
++       if(run.count&&indices.first>=run.first+run.count&&indices.first-(run.first+run.count)<=ReceiverGapBridge)
++        run.count=indices.first-run.first;
+        if(run.count&&run.first+run.count!=indices.first)submit();
+        if(!run.count)run.first=indices.first;
+        run.count+=indices.count;
+@@ -429,7 +436,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+   for(const auto& run:receiverRuns){
+    const auto& model=*run.model;const auto& sub=model.submeshes[run.sub];
+    if(bound!=&model){
+-    auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.vertices,sizeof(Vertex),4,0x3210);
++    auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.drawVertices(model.vertices),sizeof(Vertex),4,0x3210);
+     bound=&model;boundSub=~0u;
+    }
+    if(boundSub!=run.sub){
+@@ -439,7 +446,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+     C3D_DepthMap(true,-1,playerShadow::receiverBias(sub.lighting)+playerShadow::ReceiverReplayBias);
+     boundSub=run.sub;
+    }
+-   C3D_DrawElements(GPU_TRIANGLES,run.range.count,C3D_UNSIGNED_SHORT,(contactPass&&model.contactIndices?model.contactIndices:model.indices)+run.range.first);
++   C3D_DrawElements(GPU_TRIANGLES,run.range.count,C3D_UNSIGNED_SHORT,(contactPass&&model.contactIndices?model.contactIndices:model.drawIndices())+run.range.first);
+    stats_.triangles+=run.range.count/3;++stats_.drawCalls;
+   }
+  };
+@@ -455,14 +462,14 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+   auto* a=C3D_GetAttrInfo();AttrInfo_Init(a);
+   AttrInfo_AddLoader(a,0,GPU_FLOAT,3);AttrInfo_AddLoader(a,1,GPU_FLOAT,3);
+   AttrInfo_AddLoader(a,2,GPU_FLOAT,4);AttrInfo_AddLoader(a,3,GPU_UNSIGNED_BYTE,4);
+-  auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.vertices,sizeof(Vertex),4,0x3210);
++  auto* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,model.drawVertices(model.vertices),sizeof(Vertex),4,0x3210);
+   if(indexed){AttrInfo_AddLoader(a,4,GPU_FLOAT,1);BufInfo_Add(buf,model.skinBoneIndices,sizeof(float),1,4);}
+   C3D_BoolUnifSet(GPU_VERTEX_SHADER,skinnedLoc_,skin);C3D_BoolUnifSet(GPU_VERTEX_SHADER,skinnedNormalsLoc_,indexed);
+   if(skin)for(unsigned b=0;b<r.bones;++b)for(unsigned row=0;row<3;++row){
+    const auto* m=r.palette+b*12+row*4;C3D_FVUnifSet(GPU_VERTEX_SHADER,bonesLoc_+int(b*3+row),m[0],m[1],m[2],m[3]);
+   }
+   C3D_DepthMap(true,-1,playerShadow::receiverBias(r.lighting)+playerShadow::ReceiverReplayBias);
+-  C3D_DrawElements(GPU_TRIANGLES,r.count,C3D_UNSIGNED_SHORT,model.indices+r.first);
++  C3D_DrawElements(GPU_TRIANGLES,r.count,C3D_UNSIGNED_SHORT,model.drawIndices()+r.first);
+   stats_.triangles+=r.count/3;++stats_.drawCalls;
+  }
+  C3D_BoolUnifSet(GPU_VERTEX_SHADER,skinnedLoc_,false);C3D_BoolUnifSet(GPU_VERTEX_SHADER,skinnedNormalsLoc_,false);
+@@ -488,7 +495,7 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+  const auto contactStart=svcGetSystemTick();
+  const unsigned beforeContactDraws=stats_.drawCalls,beforeContactTriangles=stats_.triangles;
+ #endif
+- for(unsigned wheel=0;playerContactTex_.ready&&wheel<count;++wheel){
++ for(unsigned wheel=0;contactShadows&&playerContactTex_.ready&&wheel<count;++wheel){
+   const auto& c=casters[wheel];if(c.hideContact||c.contactRadius<=0.f)continue;
+   const float opacity=playerShadow::contactOpacity(c.contactRadius,dot(c.contactCenter-playerShadowGround_,playerShadowGroundNormal_));
+   if(opacity<=0.f)continue;
+@@ -580,7 +587,9 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+  renderMetrics.contactTriangles+=stats_.triangles-beforeContactTriangles;
+ #endif
+  C3D_SetScissor(GPU_SCISSOR_DISABLE,0,0,240,bottomWorldPass_?320:400);
+- receiversPrepared=false;contactPass=false;
++ // Body projection over the fine 16-triangle receiver blocks (built for the old
++ // wheel contact pass) instead of 128-triangle ones: far fewer vertices shaded.
++ receiversPrepared=false;contactPass=fineShadowReceivers;
+  // Shade the remaining body projection after the contact union.
+  shadowFrustum=ClipFrustum(clipRows);
+  C3D_BoolUnifSet(GPU_VERTEX_SHADER,environmentTexture2Loc_,false);
+@@ -624,11 +633,34 @@ void Renderer::playerShadowNow(const ShadowCaster* casters,unsigned count,const
+  C3D_DepthTest(true,GPU_GEQUAL,shadowUnion_?GPU_WRITE_ALPHA:GPU_WRITE_COLOR);
+  C3D_StencilTest(true,GPU_EQUAL,0,0xff,0xff);
+  C3D_StencilOp(GPU_STENCIL_KEEP,GPU_STENCIL_KEEP,GPU_STENCIL_INCR);
++ // Receivers are whole road blocks with a 6-stage, 3-texture combiner; only the
++ // projected footprint can shade. Scissor to the screen bounds of a box around
++ // it so the GPU skips the rest of each block (most of the near road).
++ {
++  const float viewportY=bottomWorldPass_?320.f:400.f;
++  const float half=actor?2400.f:extent*1.6f;
++  float x0=240.f,y0=viewportY,x1=0,y1=0;bool safe=true;
++  for(unsigned corner=0;corner<8;++corner){
++   const Vec3 v=origin+Vec3{corner&1?half:-half,corner&4?half:-half,corner&2?half:-half};
++   auto project=[&](unsigned r){return cameraClip.r[r].x*v.x+cameraClip.r[r].y*v.y+cameraClip.r[r].z*v.z+cameraClip.r[r].w;};
++   const float cw=project(3);if(cw<=1e-3f){safe=false;break;}
++   const float x=(project(0)/cw+1.f)*120.f,y=(project(1)/cw+1.f)*viewportY*.5f;
++   x0=std::min(x0,x);x1=std::max(x1,x);y0=std::min(y0,y);y1=std::max(y1,y);
++  }
++  if(safe&&shadowScissor){
++   const unsigned left=unsigned(std::clamp(std::floor(x0-2.f),0.f,240.f)),right=unsigned(std::clamp(std::ceil(x1+2.f),0.f,240.f));
++   const unsigned top=unsigned(std::clamp(std::floor(y0-2.f),0.f,viewportY)),bottom=unsigned(std::clamp(std::ceil(y1+2.f),0.f,viewportY));
++   if(left<right&&top<bottom)C3D_SetScissor(GPU_SCISSOR_NORMAL,left,top,right,bottom);
++  }
++ }
++ if(debugTinyScissor)C3D_SetScissor(GPU_SCISSOR_NORMAL,0,0,8,8);
+  receiversPass();
+  C3D_CullFace(GPU_CULL_NONE);
+  C3D_FVUnifSet(GPU_VERTEX_SHADER,shadowReceiverFadeLoc_,1,0,0,0);
+  C3D_TexBind(1,&playerShadowClipTex_);
+  objectPass();
++ if(!actor)endCategoryNow(13); // GPU profile: player shadow receivers
++ C3D_SetScissor(GPU_SCISSOR_DISABLE,0,0,240,bottomWorldPass_?320:400);
+  C3D_TexBind(0,nullptr);C3D_TexBind(1,nullptr);C3D_TexBind(2,nullptr);
+  C3D_BoolUnifSet(GPU_VERTEX_SHADER,projectedWaterLoc_,false);
+  C3D_BoolUnifSet(GPU_VERTEX_SHADER,playerShadowProjectLoc_,false);
+diff --git a/tools/release/mkw-3ds.rsf b/tools/release/mkw-3ds.rsf
+index 2d46327..b74cb6a 100644
+--- a/tools/release/mkw-3ds.rsf
++++ b/tools/release/mkw-3ds.rsf
+@@ -116,6 +116,7 @@ AccessControlInfo:
+    - hid:USER
+    - ir:rst
+    - mcu::HWC
++   - nwm::UDS
+    - ptm:u
+    - ptm:sysm
+ SystemControlInfo:
+diff --git a/vendor/kinoko/source/game/system/RaceManager.cc b/vendor/kinoko/source/game/system/RaceManager.cc
+index dce2d6c..151f76c 100644
+--- a/vendor/kinoko/source/game/system/RaceManager.cc
++++ b/vendor/kinoko/source/game/system/RaceManager.cc
+@@ -77,6 +77,16 @@ void RaceManager::endPlayerRace(u32 idx) {
+     else if (idx == 0) m_stage = Stage::FinishLocal;
+ }
+ 
++bool RaceManager::endRemaining(const std::array<u8,12>& order) {
++    if (!isStageReached(Stage::Race)) return false;
++    const Timer finishTime = m_timerManager.currentTimer();
++    for (size_t k = 0; k < m_playerCount && k < order.size(); ++k) {
++        const u8 i = order[k];
++        if (i < m_playerCount && !m_players[i].finished()) m_players[i].endRace(finishTime);
++    }
++    return true;
++}
++
+ bool RaceManager::endBattle(const std::array<u8,12>& order) {
+     if(RaceConfig::Instance()->raceScenario().gameMode!=RaceConfig::Scenario::GameMode::Battle ||
+             m_stage!=Stage::Race || m_playerCount>12)return false;
+diff --git a/vendor/kinoko/source/game/system/RaceManager.hh b/vendor/kinoko/source/game/system/RaceManager.hh
+index a49c27f..1a60866 100644
+--- a/vendor/kinoko/source/game/system/RaceManager.hh
++++ b/vendor/kinoko/source/game/system/RaceManager.hh
+@@ -122,6 +122,8 @@ public:
+     // Battle ends all racers together, with the score ordering supplied by
+     // its race-mode controller; reuse the native finish-time/finish hook.
+     bool endBattle(const std::array<u8,12>& order);
++    // Local wireless: the host ended the race; every racer still driving finishes now, in `order`.
++    bool endRemaining(const std::array<u8,12>& order);
+ 
+     void calc();
+ 

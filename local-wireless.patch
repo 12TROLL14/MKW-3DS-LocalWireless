@@ -372,7 +372,7 @@ index 4a81834..0ac92ad 100755
                                    m.shadow?&fallback:nullptr,objects,objectCount,true);
      else if(m.shadow)renderer.drawShadowVolumes(&fallback,1,.5f);
 diff --git a/src/main.cpp b/src/main.cpp
-index eebecbb..d9a5311 100755
+index eebecbb..2815fca 100755
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -28,6 +28,8 @@
@@ -419,13 +419,14 @@ index eebecbb..d9a5311 100755
      GyroTrickDevice gyroTrick;
      // consoleInit changes the bottom LCD to RGB565 and disables double buffering.
      // The normal dual-screen renderer transfers RGB8 frames, so only QA modes
-@@ -702,6 +716,13 @@ int main() {
+@@ -702,6 +716,14 @@ int main() {
          menu.enter(mkw::UiPage::Unlock);
          return true;
      };
 +    mkw::net::StartInfo guestOffer{};bool guestOfferPending=false,netGo=false,netFollow=false;
 +    bool netCpus=true; // host setting (Local Wireless page): CPUs fill the grid
 +    bool netLobbyGo=false;
++    float lobbyNetMs=0,lobbyMovieMs=0; // diagnostics: wireless lobby frame costs
 +    bool bottomEveryFrame=false; // true: lower screen redrawn every frame (60 Hz)
 +    unsigned perfHide=0; // diagnostics: 1 course 2 scenery 3 opponents 4 effects 5 sky 6 shadows 7 bottom 8 hud 9 all
 +    auto perfHit=[&](unsigned k){return perfHide==k||perfHide==9;};
@@ -433,7 +434,7 @@ index eebecbb..d9a5311 100755
      auto runMenu=[&](){
          mkw::animationStride.store(1);
          notificationLed.clear();
-@@ -793,6 +814,32 @@ int main() {
+@@ -793,6 +815,32 @@ int main() {
              return result;
          };
          while(aptMainLoop()){
@@ -452,7 +453,7 @@ index eebecbb..d9a5311 100755
 +                    }
 +                    mkw::net::guestAnswer(false,0);
 +                }
-+                mkw::net::poll();
++                {const auto t0=svcGetSystemTick();mkw::net::poll();lobbyNetMs+=(float((svcGetSystemTick()-t0)*1000.0/SYSCLOCK_ARM11)-lobbyNetMs)*.1f;}
 +                if(mkw::net::takeLobbyGo())netLobbyGo=true;
 +            }
 +            // Local wireless lobby START: straight to character selection in VS (solo).
@@ -466,7 +467,7 @@ index eebecbb..d9a5311 100755
              if(selectionSave&&selectionSave->done()){
                  menu.saveFailed=!selectionSave->ok;
                  if(selectionSave->ok)licenseSaves[selectionSave->slot]=selectionSave->value;
-@@ -821,7 +868,29 @@ int main() {
+@@ -821,7 +869,29 @@ int main() {
              const auto beforeInput=menu;
              if(selectionSave||pendingRaceMiiConfirm)input={};
              const bool acceptedInput=!transition.active()&&!selectionSave&&!pendingRaceMiiConfirm;
@@ -496,7 +497,34 @@ index eebecbb..d9a5311 100755
              if(acceptedInput&&menu.selectRaceMiiRequest>=24){
                  mkw::LicenseIdentity identity;mkw::MiiAppearance appearance;mkw::MiiBodySpec body;
                  const unsigned outfit=unsigned(menu.selectRaceMiiRequest-24);
-@@ -1204,7 +1273,28 @@ int main() {
+@@ -1043,8 +1113,10 @@ int main() {
+                 last=svcGetSystemTick();pending=0;
+             }
+             menuProfile->mark(MenuStage::Audio);
++            const auto movieStart=svcGetSystemTick();
+             menuRenderer.streamMovies(quads,motion.underlay?motion.underlay->age:visual.age,
+                                       revealed);
++            lobbyMovieMs+=(float((svcGetSystemTick()-movieStart)*1000.0/SYSCLOCK_ARM11)-lobbyMovieMs)*.1f;
+             if(!transition.active()&&menu.page==mkw::UiPage::Intro&&menuRenderer.moviesFinished()){const auto before=menu;menu.enter(mkw::UiPage::Title);transition.begin(before,menu);continue;}
+             menuProfile->mark(MenuStage::Movies);
+             if(activeAudio>=0)menuAudio.update();
+@@ -1103,6 +1175,15 @@ int main() {
+             }
+             if(!incomingReady)mkw::drawLoadingWheel(renderer,loadWaitStart);
+             if(selectionSave)mkw::drawLoadingWheel(renderer,saveStarted);
++            if(kQa&&menu.wireless&&menu.page==mkw::UiPage::VSMode){ // diagnostics: the wireless lobby's frame cost
++                static uint64_t lastFrame=0;static float frameMs=16.7f,worstMs=0;static unsigned worstAge=0;
++                const uint64_t nowTick=svcGetSystemTick();
++                if(lastFrame){const float d=float((nowTick-lastFrame)*1000.0/SYSCLOCK_ARM11);frameMs+=(d-frameMs)*.1f;
++                    if(d>worstMs||++worstAge>120){worstMs=d;worstAge=0;}}
++                lastFrame=nowTick;
++                char line[96];std::snprintf(line,sizeof line,"LOBBY %.0fF MAX%.0f NET%.1f MOV%.1f GPU%.1f",1000.f/std::max(frameMs,1.f),worstMs,lobbyNetMs,lobbyMovieMs,renderer.previousGpuMs);
++                renderer.drawScreenText(line,4,4,1.f,0xffff40ffu);
++            }
+             menuProfile->mark(MenuStage::Foreground);
+             renderer.end();
+             menuProfile->mark(MenuStage::Submit);menuProfile->end(renderer,unsigned(quads.size()));
+@@ -1204,7 +1285,28 @@ int main() {
          selectedMirror=cc==3;selectedEngineClass=std::min(cc,2u);
          selectedCpu=battleMode?menu.selection.battleCpu:vs?menu.selection.vsCpu:(selectedRaceMode==0?std::min(selectedEngineClass,2u):1u);selectedCpuVehicles=battleMode?menu.selection.battleVehicles:vs?menu.selection.vsVehicles:0;selectedItems=battleMode?menu.selection.battleItems:vs?menu.selection.vsItems:0;
      };
@@ -526,7 +554,7 @@ index eebecbb..d9a5311 100755
      bool dataReady=exists("Race/Common.szs")&&courseAvailable(courseChoice);
      if(dataReady&&(kQa&&exists("sdmc:/3ds/mkw-3ds/trace-test.txt"))) {
          // Invoke upstream's complete per-frame KRKG comparison, not just final position.
-@@ -1278,7 +1368,8 @@ int main() {
+@@ -1278,7 +1380,8 @@ int main() {
      };
  
      mkw::GpTelemetry gpTelemetry;
@@ -536,7 +564,7 @@ index eebecbb..d9a5311 100755
      struct VsSet {unsigned race=0,driver=~0u;std::array<uint8_t,12> finishPositions{};std::array<uint16_t,12> points{},roundStartPoints{};std::array<mkw::GpRacePerformance,4> performance{};std::array<bool,4> performanceCaptured{};std::array<unsigned,4> performanceCourses{};bool next=false;};
      auto vsSetStorage=std::make_unique<VsSet>();auto& vsSet=*vsSetStorage;bool nextRaceQueued=false;
      mkw::BattleSession battleSession;battleSession.reset(menu.selection.battleWins);bool sessionCoin=coinRunnersMode;
-@@ -1696,7 +1787,10 @@ int main() {
+@@ -1696,7 +1799,10 @@ int main() {
      // first, so the course's first bloom request (below) still finds its room.
      auto loadBottomScreen=[&](){
          const auto* bloom=mkw::courseBloom(Courses[courseChoice].archive);
@@ -548,7 +576,7 @@ index eebecbb..d9a5311 100755
          if(!effectsTest&&!renderer.configurePlayerShadow(menu.selection.dynamicShadows))report("WARN player shadow target unavailable; native volume retained");
          if(!renderer.configureStadiumScreen(!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))){report("FAIL stadium screen targets");return false;}
          if(!bottomScreen.load(renderer,courseChoice)){report("FAIL required bottom screen");return false;}
-@@ -1707,11 +1801,18 @@ int main() {
+@@ -1707,11 +1813,18 @@ int main() {
      // Reduced quality: the course's textures move to VRAM once bloom and the
      // bottom screen have theirs, which frees their LINEAR (render_quality.hpp).
      auto moveCourseTexturesToVram=[&](){
@@ -568,7 +596,7 @@ index eebecbb..d9a5311 100755
          LOGF("course textures in VRAM moved=%u linear_free=%lu vram_free=%lu",moved,(unsigned long)linearSpaceFree(),(unsigned long)vramSpaceFree());
      };
      // Course meshes and their spatial indices are loaded for a race and kept
-@@ -2107,7 +2208,7 @@ int main() {
+@@ -2107,7 +2220,7 @@ int main() {
          if(raceWarmupFrames)held=down=0;
          if(fullRace){
              // A or START skips the course preview; that press does nothing else.
@@ -577,7 +605,7 @@ index eebecbb..d9a5311 100755
              if(results.active()){
                  // Result boards take A/B/START (Leaderboard, USA 0x8083A5E0);
                  // the end-of-race menu moves with the D-pad and confirms with A.
-@@ -2120,11 +2221,36 @@ int main() {
+@@ -2120,11 +2233,36 @@ int main() {
                      else if(nav&(KEY_DDOWN|KEY_CPAD_DOWN))menu.input({false,true});
                      results.setCursor(menu.cursor);
                      if(menu.cursor!=oldCursor)mkw::SoundSystem::instance().play(mkw::snd::id::SE_UI_BTN_IN,0);
@@ -616,7 +644,7 @@ index eebecbb..d9a5311 100755
              // Mario Kart 7: a tap on the lower screen switches its map view.
              if((down&KEY_TOUCH)&&menu.page==mkw::UiPage::Race&&!intro.active())bottomScreen.toggleView();
              if(menu.page!=mkw::UiPage::Race&&menu.page!=mkw::UiPage::Results){
-@@ -2140,7 +2266,7 @@ int main() {
+@@ -2140,7 +2278,7 @@ int main() {
                      raceGraphicsSuspended=false;
                      raceLoadStart=svcGetSystemTick();
                      renderer.waitForGpu();menuRenderer.release();
@@ -625,7 +653,7 @@ index eebecbb..d9a5311 100755
                      // A different or previously failed course reloads completely;
                      // restarting the same race keeps its scenery.
                      const bool reloadTrack=trackCourse!=int(courseChoice);
-@@ -2169,6 +2295,33 @@ int main() {
+@@ -2169,6 +2307,33 @@ int main() {
          // should the refresh count ever stall, the clock.
          accumulator+=fullRace&&refreshes?double(std::min<u32>(refreshes,6)):std::min(delta,0.1)*60.0;
          if(raceWarmupFrames)accumulator=1; // settle initial support, never catch up loading wall time
@@ -659,7 +687,7 @@ index eebecbb..d9a5311 100755
          profiler->begin(unsigned(Courses[courseChoice].id),frames,physicsSteps,float(delta*1000));
          if(dataReady){
              if(trackLoadFailed){
-@@ -2185,6 +2338,17 @@ int main() {
+@@ -2185,6 +2350,17 @@ int main() {
                  animationPass&=loadDriver();prepareGarageFixture();driftEffects.reset();raceEffects.reset();resetKartFx();accumulator=0;
              }
              if(fullRace&&(down&KEY_SELECT))raceHud.speedometer=!raceHud.speedometer;
@@ -677,7 +705,7 @@ index eebecbb..d9a5311 100755
              if(qaMode&&((down&KEY_SELECT)||(!replay&&(down&(KEY_X|KEY_Y))))){
                  renderer.waitForGpu();
                  if(!replay&&(down&(KEY_X|KEY_Y))){
-@@ -2237,6 +2401,8 @@ int main() {
+@@ -2237,6 +2413,8 @@ int main() {
              // QA race captures: lockstep, two source ticks per presented frame, so
              // pacing-dependent presentation (name balloons) matches across builds.
              else if(raceCapture)accumulator=2;
@@ -686,7 +714,7 @@ index eebecbb..d9a5311 100755
              while(accumulator>=1){auto tick=svcGetSystemTick();bool jumpAction=false;
                  // Restore current human input every simulation tick before any
                  // temporary autopilot override, including catch-up frame exits.
-@@ -2249,6 +2415,7 @@ int main() {
+@@ -2249,6 +2427,7 @@ int main() {
                  }
                  controller->setInputsRawStick(buttons,(selectedMirror?-stick:stick)+7,7,raceTrick);
                  if(fullRace){
@@ -694,7 +722,7 @@ index eebecbb..d9a5311 100755
                      // After the goal retail hands the player to its AI
                      // (AIEngine PostRaceDriving, USA 0x80728C28): the CPU
                      // route driver steers and the item AI stays idle.
-@@ -2265,11 +2432,16 @@ int main() {
+@@ -2265,11 +2444,16 @@ int main() {
                          // The CPU route threads between boxes: QA rolls the item roulette instead.
                          if(physicsSteps%600==300&&qaGives.empty())raceItems->startRoulette(0);
                      }
@@ -711,7 +739,7 @@ index eebecbb..d9a5311 100755
                          if(kQa&&autoplay&&!afterGoal&&raceGrid.driveLocal)for(auto& g:qaGives){
                              if(g.player>=raceGrid.count())continue;
                              // Opponent POW must actually target player zero; do not alter ranks.
-@@ -2282,7 +2454,21 @@ int main() {
+@@ -2282,7 +2466,21 @@ int main() {
                                  LOGF("QA held player=%u step=%u item=%d pow=%u local_pow=%u bombs=%u blasts=%u",g.player,physicsSteps,int(h.item),unsigned(h.pow),unsigned(raceItems->hud(0).pow),bombs,blasts);
                              }
                          }
@@ -733,7 +761,7 @@ index eebecbb..d9a5311 100755
                      for(unsigned i=0;i<raceGrid.count();++i){
                          const auto& h=raceItems->hud(i);const bool held=h.deployed&&h.heldCharges>0;
                          raceGrid.ai().setItemView(i,{uint8_t(h.item),uint8_t(held?h.heldCharges:0),h.roulette!=0,held,
-@@ -2319,7 +2505,9 @@ int main() {
+@@ -2319,7 +2517,9 @@ int main() {
                  }
                  // QA: a fall boundary (variant 0) activation, so the retail SetCamera hold applies.
                  if(autoplay&&lakituRespawnStep&&physicsSteps==lakituRespawnStep){auto* qaCollide=K::Kart::KartObjectManager::Instance()->object(0)->collide();qaCollide->setOobCameraPending(uint16_t(lakituRequest));qaCollide->activateOob(false,nullptr,false,false);}
@@ -743,7 +771,7 @@ index eebecbb..d9a5311 100755
                  {
                      // The player's driver model after the kart step: its trick animation,
                      // sparkle and sound start together (trick_presentation.hpp).
-@@ -2330,6 +2518,36 @@ int main() {
+@@ -2330,6 +2530,36 @@ int main() {
                  if(intro.active()&&!raceWarmupFrames){intro.step();++introTick;if(!intro.active())endIntro();}
                  if(fullRace){
                      raceGrid.afterStep();raceItems->afterStepNative(raceGrid.count());
@@ -780,7 +808,7 @@ index eebecbb..d9a5311 100755
                      if(coinRunnersMode){
                          const auto* race=K::System::RaceManager::Instance();
                          coinBattle.step(race->isStageReached(K::System::RaceManager::Stage::Race)&&
-@@ -2440,6 +2658,7 @@ int main() {
+@@ -2440,6 +2670,7 @@ int main() {
                          }
                          if(events&Flow::EventMenuShown){menu.finish(results.finalRace());raceEvents.emit(mkw::RaceEvent::MenuShown,physicsSteps,int(results.buttonCount()));}
                          if(events&Flow::EventOptionChosen){
@@ -788,7 +816,7 @@ index eebecbb..d9a5311 100755
                              mkw::SoundSystem::instance().play(mkw::snd::id::SE_RC_PAUSE_EXIT_GAME,0);
                              raceEvents.emit(mkw::RaceEvent::OptionChosen,physicsSteps,results.chosen());
                              LOGF("race end option %s (race %u/%u)",results.chosen()==0?(results.finalRace()?"Next":"Next Race"):"Quit Game",vsSet.race,raceCount());
-@@ -3014,7 +3233,8 @@ int main() {
+@@ -3014,7 +3245,8 @@ int main() {
              }
              profiler->mark(Profile::UiPrepare);
              if(fullRace&&!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))courseObjects.requestStadiumScreen(renderer);
@@ -798,7 +826,7 @@ index eebecbb..d9a5311 100755
              {
                  // Fog follows the camera through KMP fog areas, one retail step per simulation step.
                  const unsigned steps=physicsSteps>retailFogSteps?physicsSteps-retailFogSteps:0;retailFogSteps=physicsSteps;
-@@ -3097,6 +3317,17 @@ int main() {
+@@ -3097,6 +3329,17 @@ int main() {
              // Snapshot the original chassis transform before the player pose
              // worker reads VehicleAnimation's lazy matrices.
              const C3D_Mtx playerShadowTransform=vehicleAnimation.body();
@@ -816,7 +844,7 @@ index eebecbb..d9a5311 100755
              const bool playerBattleVisible=cameraKart->move()->battleVisible();
              // Native soft-wall contact distinguishes an entered snow shell
              // from the supporting ground underneath; ordinary offroad wheel
-@@ -3112,42 +3343,45 @@ int main() {
+@@ -3112,42 +3355,45 @@ int main() {
              bool objectSupport=cameraKart->collisionData().bHasRoadVel;
              for(unsigned w=0;w<vehicleAnimation.wheelCount();++w)
                  objectSupport|=cameraKart->collisionData(w).bHasRoadVel;
@@ -874,7 +902,7 @@ index eebecbb..d9a5311 100755
              auto drawSkinned=[&](const mkw::DriverAnimation* bank,const mkw::Model& model,const C3D_Mtx& matrix){
                  if(bank&&bank->gpuSkinned())renderer.setSkinPalette(bank->palette(),bank->matrixCount(),21);
                  renderer.draw(model,matrix);
-@@ -3185,7 +3419,7 @@ int main() {
+@@ -3185,7 +3431,7 @@ int main() {
              if(coinRunnersMode){renderer.setCourseLighting(true);coinBattle.draw(renderer,physicsSteps);renderer.setCourseLighting(false);}
              if(battleMode&&!coinRunnersMode)balloonRuntime.draw(renderer);
              renderer.additiveColor=0;
@@ -883,7 +911,7 @@ index eebecbb..d9a5311 100755
              renderer.setCourseLighting(true);
              Mtx_Identity(&transform);
              for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true);
-@@ -3241,9 +3475,9 @@ int main() {
+@@ -3241,9 +3487,9 @@ int main() {
                  const auto origin=vec(cameraKart->pos());
                  const mkw::Renderer::ShadowVolume fallback{vehicleShadow.get(),playerShadowTransform};
                  const auto& objectReceivers=courseObjects.shadowReceivers(origin,std::max(320.f,320.f*cameraKart->scale().y)*4.f);
@@ -895,7 +923,7 @@ index eebecbb..d9a5311 100755
                  std::array<const mkw::Model*,256> receivers{};unsigned count=0;
                  for(const auto& model:track)if(count<receivers.size())receivers[count++]=model.get();
                  const auto& objects=courseObjects.shadowReceivers(lakitu.position(),2400.f);
-@@ -3251,18 +3485,19 @@ int main() {
+@@ -3251,18 +3497,19 @@ int main() {
                                    objects.data(),unsigned(objects.size()));
              }
              if(mergeJudgeShadow)renderer.setShadowUnion(false);
@@ -917,7 +945,7 @@ index eebecbb..d9a5311 100755
  
                  raceHud.drawOverlay(renderer,*raceItems,unsigned(race->stage()),race->timer(),battleMode?battleRank(0):raceGrid.rank(),raceGrid.lap(),battleMode?battleTicks>=balloonBattle.durationTicks():raceGrid.finished(),physicsSteps,results.finishFrame(),results.hudSlide(),camera->lookingBack());
  }
-@@ -3270,11 +3505,15 @@ int main() {
+@@ -3270,11 +3517,15 @@ int main() {
              if(fullRace)flowUi.drawResults(renderer,results,bottomScreen.miiPortrait());
              renderer.setScreenDepth(0);
              if(fullRace)flowUi.drawWipe(renderer,cameraDirector->wipeProgress());
@@ -935,7 +963,7 @@ index eebecbb..d9a5311 100755
                  // The lower LCD: the race read, never written (src/race_bottom_screen.cpp).
                  mkw::fillBottomView(bottomView,raceGrid,*raceItems,intro.active(),physicsSteps,results.leaveFade());
                  if(battleMode){
-@@ -3285,7 +3524,7 @@ int main() {
+@@ -3285,7 +3536,7 @@ int main() {
                  renderer.beginBottom();
                  bottomScreen.draw(renderer,bottomView);
              }
@@ -1116,10 +1144,10 @@ index 3fab23d..e8b0ec1 100755
      text.bottom=false;top.push_back(text);break;}
 diff --git a/src/netplay.cpp b/src/netplay.cpp
 new file mode 100644
-index 0000000..a6ce452
+index 0000000..d33c2d3
 --- /dev/null
 +++ b/src/netplay.cpp
-@@ -0,0 +1,720 @@
+@@ -0,0 +1,741 @@
 +// Local wireless VS races, 2 to 12 racers (see include/mkw/netplay.hpp).
 +#include <mkw/netplay.hpp>
 +#include <3ds.h>
@@ -1225,7 +1253,8 @@ index 0000000..a6ce452
 +unsigned toMs(u64 ticks) { return unsigned(ticks / (SYSCLOCK_ARM11 / 1000)); }
 +
 +// SD writes can stall a frame, so during a race lines wait in memory until it ends.
-+char logBuffer_[6144]; size_t logUsed_ = 0; bool logHold_ = false;
++// Lines stay in memory (SD writes stall a frame): written when the wireless session ends.
++char logBuffer_[6144]; size_t logUsed_ = 0; bool logHold_ = true;
 +void flushLog() {
 +    if (!logUsed_) return;
 +    if (FILE* f = fopen("sdmc:/3ds/mkw-3ds/netplay.log", "a")) { fwrite(logBuffer_, 1, logUsed_, f); fclose(f); }
@@ -1416,6 +1445,8 @@ index 0000000..a6ce452
 +
 +// ---- Background search for a host (a scan blocks for a while) ----
 +bool exitHooked_ = false, joining_ = false;
++volatile bool udsReady_ = false, starting_ = false;
++Thread startThread_ = nullptr;
 +char status_[96] = "";
 +Thread scanThread_ = nullptr; volatile bool scanStop_ = false;
 +void scanOnce() {
@@ -1430,7 +1461,9 @@ index 0000000..a6ce452
 +    }
 +    free(networks);
 +}
++bool startUds();
 +void scanMain(void*) {
++    if (!udsReady_ && !startUds()) { joining_ = false; return; }
 +    while (!scanStop_ && joining_ && !up_) { scanOnce(); for (int i = 0; i < 10 && !scanStop_; ++i) svcSleepThread(50 * 1000000LL); }
 +}
 +void stopScan() {
@@ -1439,7 +1472,7 @@ index 0000000..a6ce452
 +}
 +bool startUds() {
 +    const Result r = udsInit(0x3000, nullptr);
-+    if (R_SUCCEEDED(r)) { if (!exitHooked_) { exitHooked_ = true; atexit(shutdown); } return true; }
++    if (R_SUCCEEDED(r)) { udsReady_ = true; return true; }
 +    log("udsInit %08lx", (unsigned long)r);
 +    snprintf(status_, sizeof status_, "Wireless error %08lX", (unsigned long)r);
 +    return false;
@@ -1456,6 +1489,11 @@ index 0000000..a6ce452
 +
 +void poll() {
 +    if (scanThread_ && (up_ || !joining_)) stopScan(); // the search ended: collect its thread
++    if (startThread_ && !starting_) {                   // hosting start-up finished
++        threadJoin(startThread_, U64_MAX); threadFree(startThread_); startThread_ = nullptr;
++        if (!up_) { if (udsReady_) { udsExit(); udsReady_ = false; } role_ = Role::None; }
++    }
++    if (role_ == Role::Guest && !scanThread_ && !up_ && !joining_ && !udsReady_) role_ = Role::None; // start-up failed
 +    if (!up_) return;
 +    // Read until the queue is empty. (udsWaitDataAvailable is not a reliable
 +    // "anything waiting?" test: gating on it left packets queued for seconds.)
@@ -1510,24 +1548,32 @@ index 0000000..a6ce452
 +    restoreLowerScreen();
 +}
 +
-+void hostBegin() {
-+    if (role_ != Role::None) return;
-+    if (!startUds()) return;
-+    resetLink();
++// Wireless start-up (udsInit, udsCreateNetwork) blocks for a while: it runs on a
++// worker so the menu keeps animating; poll() collects the result.
++void hostMain(void*) {
++    if (!udsReady_ && !startUds()) { starting_ = false; return; }
 +    udsNetworkStruct network;
 +    udsGenerateDefaultNetworkStruct(&network, CommId, 0, MaxNodes);
 +    const Result r = udsCreateNetwork(&network, Passphrase, sizeof Passphrase, &bind_, Channel, UDS_DEFAULT_RECVBUFSIZE);
 +    if (R_FAILED(r)) {
-+        log("udsCreateNetwork %08lx", (unsigned long)r); udsExit();
++        log("udsCreateNetwork %08lx", (unsigned long)r);
 +        snprintf(status_, sizeof status_, "Wireless error %08lX", (unsigned long)r);
-+        return;
-+    }
-+    role_ = Role::Host; up_ = true; learnNode(); log("hosting");
++    } else { learnNode(); up_ = true; log("hosting"); }
++    starting_ = false;
++}
++void hostBegin() {
++    if (role_ != Role::None) return;
++    if (!exitHooked_) { exitHooked_ = true; atexit(shutdown); }
++    resetLink();
++    role_ = Role::Host; starting_ = true;
++    s32 priority = 0x30; svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
++    startThread_ = threadCreate(hostMain, nullptr, 0x4000, int(std::min<s32>(priority + 1, 0x3F)), -2, false);
++    if (!startThread_) { starting_ = false; log("host thread failed"); shutdown(); }
 +}
 +
 +void joinBegin() {
 +    if (role_ != Role::None) return;
-+    if (!startUds()) return;
++    if (!exitHooked_) { exitHooked_ = true; atexit(shutdown); }
 +    resetLink();
 +    role_ = Role::Guest; joining_ = true; scanStop_ = false;
 +    s32 priority = 0x30; svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
@@ -1539,6 +1585,7 @@ index 0000000..a6ce452
 +    // Short: one footer line, characters limited to menu_ui's uiWirelessGlyphs.
 +    if (role_ == Role::None) return status_[0] ? status_ : "Host a race or join one";
 +    if (role_ == Role::Host) {
++        if (!up_) { snprintf(status_, sizeof status_, "Hosting - starting..."); return status_; }
 +        const unsigned n = guestCount() + 1;
 +        snprintf(status_, sizeof status_, n > 1 ? "Hosting - %u players - START to begin" : "Hosting - %u player", n);
 +        return status_;
@@ -1551,7 +1598,10 @@ index 0000000..a6ce452
 +void shutdown() {
 +    if (role_ == Role::None) return;
 +    joining_ = false; stopScan();
-+    stopUds(); udsExit(); role_ = Role::None;
++    if (startThread_) { threadJoin(startThread_, U64_MAX); threadFree(startThread_); startThread_ = nullptr; starting_ = false; }
++    stopUds(); if (udsReady_) { udsExit(); udsReady_ = false; }
++    role_ = Role::None;
++    flushLog();
 +}
 +
 +bool hostStartRace(const StartInfo& info, uint16_t hostGarage, const uint16_t* cpuGarages, unsigned cpuCount) {
@@ -1769,7 +1819,6 @@ index 0000000..a6ce452
 +void endRace() {
 +    if (inRace_) log("race %u ends", raceId_);
 +    inRace_ = false; go_ = false; raceOver_ = false;
-+    logHold_ = false; flushLog();
 +}
 +
 +void hostRaceOver() {

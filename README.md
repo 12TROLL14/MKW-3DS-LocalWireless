@@ -20,7 +20,7 @@ from the builder folder you already used to build the game.
 - After a race the host chooses what's next; guests see the results and follow
 - If the host leaves, guests take over the remaining racers; a guest who stops
   responding is replaced by a CPU
-- **Performance**: steadier 60 fps in 2D and a stable 30 fps in 3D (on new 3ds, hasn't been tested on OLD models) (lighter
+- **Performance**: steadier 60 fps in 2D and a stable 30 fps in 3D (on new 3ds, hasn't yet been tested on OLD models) (lighter
   shadows and effects, better GPU scheduling, earlier detail switching for CPUs)
 
 Network play uses the 3DS's own local wireless (UDS): no router or internet needed.

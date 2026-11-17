@@ -8,6 +8,8 @@ This repository is **only a patch and a build script**. It contains no game
 files and none of the port itself. You build a small **update CIA** (about 3 MB)
 from the builder folder you already used to build the game.
 
+**Full transparency: MKW-3DS-LocalWireless has been made with heavy help from an AI assistant (Claude)**
+
 ## Features
 
 - **Host / Join** from *Multiplayer* in the main menu; the lobby shows how many

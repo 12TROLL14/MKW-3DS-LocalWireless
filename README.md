@@ -8,15 +8,15 @@ This repository is **only a patch and a build script**. It contains no game
 files and none of the port itself. You build a small **update CIA** (about 3 MB)
 from the builder folder you already used to build the game.
 
-**Full transparency: MKW-3DS-LocalWireless has been made with heavy help from an AI assistant (Claude)**
-
 ## Features
 
-- **Host / Join** from *Multiplayer* in the main menu; the lobby shows how many
-  players are connected
+- **Host / Join** from *Multiplayer* in the main menu; guests see a **list of
+  hosts** in range (license name and player count) and pick one
 - Host settings: **CPUs on/off** and **engine class** (50cc, 100cc, 150cc, Mirror)
 - Host presses **START**: every console goes straight to character selection
 - Everyone picks their own **driver, kart and drift mode**; the host picks the course
+- The race waits for every console to load, with a **"Waiting for"** screen
+  showing who is still loading
 - **License names** above karts
 - **Items synchronised**: item boxes, hits and thrown items
 - After a race the host chooses what's next; guests see the results and follow
@@ -33,7 +33,8 @@ Network play uses the 3DS's own local wireless (UDS): no router or internet need
   **v0.7.0**, and that builder folder still on your computer (it reuses its
   toolchain and build files)
 - **Git** (https://git-scm.com), only to build the update yourself
-- Every console that plays needs the game installed and this update CIA on top
+- A **New 3DS or New 2DS** for every player, with the game installed and this
+  update CIA on top
 
 ## Build the update CIA yourself
 
@@ -77,7 +78,9 @@ back to the normal game, install MiniBandit's official update.
 ## Play
 
 1. **Main menu → Multiplayer** on every console.
-2. One console chooses **Host**, the others **Join**.
+2. One console chooses **Host**. The others choose **Join**, wait for the host's
+   name to appear (press the first button to cycle if there are several hosts),
+   then press **Join**.
 3. The host sets CPUs and the engine class, then presses **START** once everyone
    has joined.
 4. Pick your driver, kart and drift mode. Guests then wait on the cup page while
@@ -85,9 +88,12 @@ back to the normal game, install MiniBandit's official update.
 
 ## Status and limits
 
-- Tested with two New 3DS XL consoles.
-- The network code is written for up to 12 players; three or more consoles and
-  leaving mid-race haven't been tested yet.
+- **New 3DS / New 2DS only.** On an original 3DS or 2DS the Multiplayer page says
+  so: tested on an Old 2DS, races ran far too slowly (the port is already at its
+  limit there in solo play).
+- Tested with two New 3DS LL consoles; 3-console races tested with an Old 2DS.
+- The network code is written for up to 12 players; three or more New 3DS
+  consoles and leaving mid-race haven't been tested yet.
 - VS races only: no Grand Prix, battle or team races in multiplayer.
 - Every console must run the same update (the lobby ignores other versions).
 

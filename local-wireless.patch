@@ -39,16 +39,17 @@ index 3d2b967..ec4b257 100755
   std::array<unsigned,10> battleStageDeck{};unsigned battleStageIndex=0;
 diff --git a/include/mkw/netplay.hpp b/include/mkw/netplay.hpp
 new file mode 100644
-index 0000000..d2dddaf
+index 0000000..51f6153
 --- /dev/null
 +++ b/include/mkw/netplay.hpp
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,96 @@
 +#pragma once
 +// Local wireless (UDS: console to console, no access point) VS races, 2 to 12 racers.
 +// Star layout: guests talk only to the host; the host bundles every kart into one packet.
 +// Every racer has a race ID (its grid position), the same on every console. Each console
 +// simulates its own kart as racer index 0; the host also drives the CPUs. Other racers are
 +// driven by their received inputs and pulled toward their received state.
++#include <cstddef>
 +#include <cstdint>
 +
 +namespace Kinoko::Kart { class KartObject; }
@@ -106,6 +107,14 @@ index 0000000..d2dddaf
 +bool takeRaceOver();
 +// Lobby: the host sends every console to character selection (VS); guests take it once.
 +void hostLobbyGo();
++// Race loading: a load step finished (progress for the others' waiting text), and the
++// text to show while the race waits for consoles still loading (empty when not waiting).
++void loadStage();
++void waitingText(char* out, std::size_t size);
++// Joining: hosts in range (license name and players), and the guest's choice.
++unsigned hostCount();
++void hostLabel(unsigned index, char* out, std::size_t size);
++void joinHost(unsigned index);
 +bool takeLobbyGo();
 +
 +// Items. The console that owns a racer decides its item boxes and the hits it takes and
@@ -372,7 +381,7 @@ index 4a81834..0ac92ad 100755
                                    m.shadow?&fallback:nullptr,objects,objectCount,true);
      else if(m.shadow)renderer.drawShadowVolumes(&fallback,1,.5f);
 diff --git a/src/main.cpp b/src/main.cpp
-index eebecbb..2815fca 100755
+index eebecbb..60359d9 100755
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -28,6 +28,8 @@
@@ -419,13 +428,23 @@ index eebecbb..2815fca 100755
      GyroTrickDevice gyroTrick;
      // consoleInit changes the bottom LCD to RGB565 and disables double buffering.
      // The normal dual-screen renderer transfers RGB8 frames, so only QA modes
-@@ -702,6 +716,14 @@ int main() {
+@@ -454,6 +468,7 @@ int main() {
+     };
+     uint64_t stageTick=0;unsigned stageOpens=0;unsigned long long stageOpenTicks=0;
+     auto stage=[&](const char* name){
++        mkw::net::loadStage(); // local wireless: loading progress for the other consoles
+         const auto now=svcGetSystemTick();const unsigned opens=mkw::fileOpens.load();const auto openTicks=mkw::fileOpenTicks.load();
+         if(stageTick&&menuProfile->enabled()){char text[240];snprintf(text,sizeof text,"load %s %.1f ms, %u opens (%.1f ms opening) heap_free=%lu largest=%lu linear_free=%lu",name,double(now-stageTick)*1000.0/SYSCLOCK_ARM11,opens-stageOpens,double(openTicks-stageOpenTicks)*1000.0/SYSCLOCK_ARM11,(unsigned long)mkw::heapSpaceFree(),(unsigned long)largestHeapBlock(),(unsigned long)linearSpaceFree());menuProfile->event(text);report(text);}
+         stageTick=now;stageOpens=opens;stageOpenTicks=openTicks;
+@@ -702,6 +717,16 @@ int main() {
          menu.enter(mkw::UiPage::Unlock);
          return true;
      };
 +    mkw::net::StartInfo guestOffer{};bool guestOfferPending=false,netGo=false,netFollow=false;
 +    bool netCpus=true; // host setting (Local Wireless page): CPUs fill the grid
 +    bool netLobbyGo=false;
++    const bool newConsole=[]{bool n=false;APT_CheckNew3DS(&n);return n;}(); // local wireless is New 3DS only
++    unsigned netHostChoice=0; // guest: which host in range is selected
 +    float lobbyNetMs=0,lobbyMovieMs=0; // diagnostics: wireless lobby frame costs
 +    bool bottomEveryFrame=false; // true: lower screen redrawn every frame (60 Hz)
 +    unsigned perfHide=0; // diagnostics: 1 course 2 scenery 3 opponents 4 effects 5 sky 6 shadows 7 bottom 8 hud 9 all
@@ -434,7 +453,7 @@ index eebecbb..2815fca 100755
      auto runMenu=[&](){
          mkw::animationStride.store(1);
          notificationLed.clear();
-@@ -793,6 +815,32 @@ int main() {
+@@ -793,6 +818,32 @@ int main() {
              return result;
          };
          while(aptMainLoop()){
@@ -467,12 +486,12 @@ index eebecbb..2815fca 100755
              if(selectionSave&&selectionSave->done()){
                  menu.saveFailed=!selectionSave->ok;
                  if(selectionSave->ok)licenseSaves[selectionSave->slot]=selectionSave->value;
-@@ -821,7 +869,29 @@ int main() {
+@@ -821,7 +872,46 @@ int main() {
              const auto beforeInput=menu;
              if(selectionSave||pendingRaceMiiConfirm)input={};
              const bool acceptedInput=!transition.active()&&!selectionSave&&!pendingRaceMiiConfirm;
 +            {   // The Local Wireless page: its labels follow this console's role.
-+                static char labels[2][24];using R=mkw::net::Role;const auto role=mkw::net::role();
++                static char labels[2][40];using R=mkw::net::Role;const auto role=mkw::net::role();
 +                if(role==R::Host){
 +                    std::snprintf(labels[0],sizeof labels[0],"CPUs: %s",netCpus?"On":"Off");
 +                    static const char* classes[]={"50cc","100cc","150cc","Mirror"};
@@ -482,9 +501,18 @@ index eebecbb..2815fca 100755
 +                    unsigned player=2;std::sscanf(mkw::net::statusText(),"Joined as player %u",&player);
 +                    std::snprintf(labels[0],sizeof labels[0],"Player %u",player);
 +                    mkw::uiWirelessLabels[0]=labels[0];mkw::uiWirelessLabels[1]="Waiting for host";
++                }else if(role==R::Guest){
++                    // Choosing a host: the first button cycles through the hosts in range.
++                    const unsigned hosts=mkw::net::hostCount();
++                    if(netHostChoice>=hosts)netHostChoice=0;
++                    if(hosts){mkw::net::hostLabel(netHostChoice,labels[0],sizeof labels[0]);mkw::uiWirelessLabels[0]=labels[0];
++                        std::snprintf(labels[1],sizeof labels[1],hosts>1?"Join  %u of %u":"Join",netHostChoice+1,hosts);mkw::uiWirelessLabels[1]=labels[1];}
++                    else{mkw::uiWirelessLabels[0]="Searching...";mkw::uiWirelessLabels[1]="No host yet";}
++                }else if(!newConsole){ // Old 3DS / 2DS: too slow for wireless races (tested)
++                    mkw::uiWirelessLabels[0]="New 3DS required";mkw::uiWirelessLabels[1]="Not available";
 +                }else mkw::uiWirelessLabels[0]=mkw::uiWirelessLabels[1]=nullptr;
 +            }
-+            mkw::uiWirelessStatus=mkw::net::statusText();
++            mkw::uiWirelessStatus=newConsole?mkw::net::statusText():"Local wireless needs a New 3DS";
 +            menu.netGuest=mkw::net::role()==mkw::net::Role::Guest&&mkw::net::connected();
              auto action=transition.input(menu,input);
 +            if(menu.wirelessRequest>=0){
@@ -492,12 +520,20 @@ index eebecbb..2815fca 100755
 +                if(request==3){if(mkw::net::role()==R::Host&&mkw::net::connected()){mkw::net::hostLobbyGo();netLobbyGo=true;}}
 +                else if(request==2)mkw::net::shutdown();
 +                else if(mkw::net::role()==R::Host){if(request==0)netCpus=!netCpus;else if(request==1)netClass=(netClass+1)%4;} // host settings
-+                else if(mkw::net::role()==R::None){if(request==0)mkw::net::hostBegin();else mkw::net::joinBegin();}
++                else if(mkw::net::role()==R::Guest&&!mkw::net::connected()){
++                    const unsigned hosts=mkw::net::hostCount();
++                    if(request==0&&hosts)netHostChoice=(netHostChoice+1)%hosts;
++                    else if(request==1&&hosts)mkw::net::joinHost(netHostChoice);
++                }
++                else if(mkw::net::role()==R::None&&newConsole){
++                    if(request==0){mkw::net::setLocalName(licenseSaves[activeLicense].name.data());mkw::net::hostBegin();}
++                    else{netHostChoice=0;mkw::net::joinBegin();}
++                }
 +            }
              if(acceptedInput&&menu.selectRaceMiiRequest>=24){
                  mkw::LicenseIdentity identity;mkw::MiiAppearance appearance;mkw::MiiBodySpec body;
                  const unsigned outfit=unsigned(menu.selectRaceMiiRequest-24);
-@@ -1043,8 +1113,10 @@ int main() {
+@@ -1043,8 +1133,10 @@ int main() {
                  last=svcGetSystemTick();pending=0;
              }
              menuProfile->mark(MenuStage::Audio);
@@ -508,7 +544,7 @@ index eebecbb..2815fca 100755
              if(!transition.active()&&menu.page==mkw::UiPage::Intro&&menuRenderer.moviesFinished()){const auto before=menu;menu.enter(mkw::UiPage::Title);transition.begin(before,menu);continue;}
              menuProfile->mark(MenuStage::Movies);
              if(activeAudio>=0)menuAudio.update();
-@@ -1103,6 +1175,15 @@ int main() {
+@@ -1103,6 +1195,15 @@ int main() {
              }
              if(!incomingReady)mkw::drawLoadingWheel(renderer,loadWaitStart);
              if(selectionSave)mkw::drawLoadingWheel(renderer,saveStarted);
@@ -524,7 +560,7 @@ index eebecbb..2815fca 100755
              menuProfile->mark(MenuStage::Foreground);
              renderer.end();
              menuProfile->mark(MenuStage::Submit);menuProfile->end(renderer,unsigned(quads.size()));
-@@ -1204,7 +1285,28 @@ int main() {
+@@ -1204,7 +1305,28 @@ int main() {
          selectedMirror=cc==3;selectedEngineClass=std::min(cc,2u);
          selectedCpu=battleMode?menu.selection.battleCpu:vs?menu.selection.vsCpu:(selectedRaceMode==0?std::min(selectedEngineClass,2u):1u);selectedCpuVehicles=battleMode?menu.selection.battleVehicles:vs?menu.selection.vsVehicles:0;selectedItems=battleMode?menu.selection.battleItems:vs?menu.selection.vsItems:0;
      };
@@ -554,7 +590,7 @@ index eebecbb..2815fca 100755
      bool dataReady=exists("Race/Common.szs")&&courseAvailable(courseChoice);
      if(dataReady&&(kQa&&exists("sdmc:/3ds/mkw-3ds/trace-test.txt"))) {
          // Invoke upstream's complete per-frame KRKG comparison, not just final position.
-@@ -1278,7 +1380,8 @@ int main() {
+@@ -1278,7 +1400,8 @@ int main() {
      };
  
      mkw::GpTelemetry gpTelemetry;
@@ -564,7 +600,7 @@ index eebecbb..2815fca 100755
      struct VsSet {unsigned race=0,driver=~0u;std::array<uint8_t,12> finishPositions{};std::array<uint16_t,12> points{},roundStartPoints{};std::array<mkw::GpRacePerformance,4> performance{};std::array<bool,4> performanceCaptured{};std::array<unsigned,4> performanceCourses{};bool next=false;};
      auto vsSetStorage=std::make_unique<VsSet>();auto& vsSet=*vsSetStorage;bool nextRaceQueued=false;
      mkw::BattleSession battleSession;battleSession.reset(menu.selection.battleWins);bool sessionCoin=coinRunnersMode;
-@@ -1696,7 +1799,10 @@ int main() {
+@@ -1696,7 +1819,10 @@ int main() {
      // first, so the course's first bloom request (below) still finds its room.
      auto loadBottomScreen=[&](){
          const auto* bloom=mkw::courseBloom(Courses[courseChoice].archive);
@@ -576,7 +612,7 @@ index eebecbb..2815fca 100755
          if(!effectsTest&&!renderer.configurePlayerShadow(menu.selection.dynamicShadows))report("WARN player shadow target unavailable; native volume retained");
          if(!renderer.configureStadiumScreen(!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))){report("FAIL stadium screen targets");return false;}
          if(!bottomScreen.load(renderer,courseChoice)){report("FAIL required bottom screen");return false;}
-@@ -1707,11 +1813,18 @@ int main() {
+@@ -1707,11 +1833,18 @@ int main() {
      // Reduced quality: the course's textures move to VRAM once bloom and the
      // bottom screen have theirs, which frees their LINEAR (render_quality.hpp).
      auto moveCourseTexturesToVram=[&](){
@@ -596,7 +632,7 @@ index eebecbb..2815fca 100755
          LOGF("course textures in VRAM moved=%u linear_free=%lu vram_free=%lu",moved,(unsigned long)linearSpaceFree(),(unsigned long)vramSpaceFree());
      };
      // Course meshes and their spatial indices are loaded for a race and kept
-@@ -2107,7 +2220,7 @@ int main() {
+@@ -2107,7 +2240,7 @@ int main() {
          if(raceWarmupFrames)held=down=0;
          if(fullRace){
              // A or START skips the course preview; that press does nothing else.
@@ -605,7 +641,7 @@ index eebecbb..2815fca 100755
              if(results.active()){
                  // Result boards take A/B/START (Leaderboard, USA 0x8083A5E0);
                  // the end-of-race menu moves with the D-pad and confirms with A.
-@@ -2120,11 +2233,36 @@ int main() {
+@@ -2120,11 +2253,36 @@ int main() {
                      else if(nav&(KEY_DDOWN|KEY_CPAD_DOWN))menu.input({false,true});
                      results.setCursor(menu.cursor);
                      if(menu.cursor!=oldCursor)mkw::SoundSystem::instance().play(mkw::snd::id::SE_UI_BTN_IN,0);
@@ -644,7 +680,7 @@ index eebecbb..2815fca 100755
              // Mario Kart 7: a tap on the lower screen switches its map view.
              if((down&KEY_TOUCH)&&menu.page==mkw::UiPage::Race&&!intro.active())bottomScreen.toggleView();
              if(menu.page!=mkw::UiPage::Race&&menu.page!=mkw::UiPage::Results){
-@@ -2140,7 +2278,7 @@ int main() {
+@@ -2140,7 +2298,7 @@ int main() {
                      raceGraphicsSuspended=false;
                      raceLoadStart=svcGetSystemTick();
                      renderer.waitForGpu();menuRenderer.release();
@@ -653,7 +689,7 @@ index eebecbb..2815fca 100755
                      // A different or previously failed course reloads completely;
                      // restarting the same race keeps its scenery.
                      const bool reloadTrack=trackCourse!=int(courseChoice);
-@@ -2169,6 +2307,33 @@ int main() {
+@@ -2169,6 +2327,33 @@ int main() {
          // should the refresh count ever stall, the clock.
          accumulator+=fullRace&&refreshes?double(std::min<u32>(refreshes,6)):std::min(delta,0.1)*60.0;
          if(raceWarmupFrames)accumulator=1; // settle initial support, never catch up loading wall time
@@ -687,7 +723,7 @@ index eebecbb..2815fca 100755
          profiler->begin(unsigned(Courses[courseChoice].id),frames,physicsSteps,float(delta*1000));
          if(dataReady){
              if(trackLoadFailed){
-@@ -2185,6 +2350,17 @@ int main() {
+@@ -2185,6 +2370,17 @@ int main() {
                  animationPass&=loadDriver();prepareGarageFixture();driftEffects.reset();raceEffects.reset();resetKartFx();accumulator=0;
              }
              if(fullRace&&(down&KEY_SELECT))raceHud.speedometer=!raceHud.speedometer;
@@ -705,7 +741,7 @@ index eebecbb..2815fca 100755
              if(qaMode&&((down&KEY_SELECT)||(!replay&&(down&(KEY_X|KEY_Y))))){
                  renderer.waitForGpu();
                  if(!replay&&(down&(KEY_X|KEY_Y))){
-@@ -2237,6 +2413,8 @@ int main() {
+@@ -2237,6 +2433,8 @@ int main() {
              // QA race captures: lockstep, two source ticks per presented frame, so
              // pacing-dependent presentation (name balloons) matches across builds.
              else if(raceCapture)accumulator=2;
@@ -714,7 +750,7 @@ index eebecbb..2815fca 100755
              while(accumulator>=1){auto tick=svcGetSystemTick();bool jumpAction=false;
                  // Restore current human input every simulation tick before any
                  // temporary autopilot override, including catch-up frame exits.
-@@ -2249,6 +2427,7 @@ int main() {
+@@ -2249,6 +2447,7 @@ int main() {
                  }
                  controller->setInputsRawStick(buttons,(selectedMirror?-stick:stick)+7,7,raceTrick);
                  if(fullRace){
@@ -722,7 +758,7 @@ index eebecbb..2815fca 100755
                      // After the goal retail hands the player to its AI
                      // (AIEngine PostRaceDriving, USA 0x80728C28): the CPU
                      // route driver steers and the item AI stays idle.
-@@ -2265,11 +2444,16 @@ int main() {
+@@ -2265,11 +2464,16 @@ int main() {
                          // The CPU route threads between boxes: QA rolls the item roulette instead.
                          if(physicsSteps%600==300&&qaGives.empty())raceItems->startRoulette(0);
                      }
@@ -739,7 +775,7 @@ index eebecbb..2815fca 100755
                          if(kQa&&autoplay&&!afterGoal&&raceGrid.driveLocal)for(auto& g:qaGives){
                              if(g.player>=raceGrid.count())continue;
                              // Opponent POW must actually target player zero; do not alter ranks.
-@@ -2282,7 +2466,21 @@ int main() {
+@@ -2282,7 +2486,21 @@ int main() {
                                  LOGF("QA held player=%u step=%u item=%d pow=%u local_pow=%u bombs=%u blasts=%u",g.player,physicsSteps,int(h.item),unsigned(h.pow),unsigned(raceItems->hud(0).pow),bombs,blasts);
                              }
                          }
@@ -761,7 +797,7 @@ index eebecbb..2815fca 100755
                      for(unsigned i=0;i<raceGrid.count();++i){
                          const auto& h=raceItems->hud(i);const bool held=h.deployed&&h.heldCharges>0;
                          raceGrid.ai().setItemView(i,{uint8_t(h.item),uint8_t(held?h.heldCharges:0),h.roulette!=0,held,
-@@ -2319,7 +2517,9 @@ int main() {
+@@ -2319,7 +2537,9 @@ int main() {
                  }
                  // QA: a fall boundary (variant 0) activation, so the retail SetCamera hold applies.
                  if(autoplay&&lakituRespawnStep&&physicsSteps==lakituRespawnStep){auto* qaCollide=K::Kart::KartObjectManager::Instance()->object(0)->collide();qaCollide->setOobCameraPending(uint16_t(lakituRequest));qaCollide->activateOob(false,nullptr,false,false);}
@@ -771,7 +807,7 @@ index eebecbb..2815fca 100755
                  {
                      // The player's driver model after the kart step: its trick animation,
                      // sparkle and sound start together (trick_presentation.hpp).
-@@ -2330,6 +2530,36 @@ int main() {
+@@ -2330,6 +2550,36 @@ int main() {
                  if(intro.active()&&!raceWarmupFrames){intro.step();++introTick;if(!intro.active())endIntro();}
                  if(fullRace){
                      raceGrid.afterStep();raceItems->afterStepNative(raceGrid.count());
@@ -808,7 +844,7 @@ index eebecbb..2815fca 100755
                      if(coinRunnersMode){
                          const auto* race=K::System::RaceManager::Instance();
                          coinBattle.step(race->isStageReached(K::System::RaceManager::Stage::Race)&&
-@@ -2440,6 +2670,7 @@ int main() {
+@@ -2440,6 +2690,7 @@ int main() {
                          }
                          if(events&Flow::EventMenuShown){menu.finish(results.finalRace());raceEvents.emit(mkw::RaceEvent::MenuShown,physicsSteps,int(results.buttonCount()));}
                          if(events&Flow::EventOptionChosen){
@@ -816,7 +852,7 @@ index eebecbb..2815fca 100755
                              mkw::SoundSystem::instance().play(mkw::snd::id::SE_RC_PAUSE_EXIT_GAME,0);
                              raceEvents.emit(mkw::RaceEvent::OptionChosen,physicsSteps,results.chosen());
                              LOGF("race end option %s (race %u/%u)",results.chosen()==0?(results.finalRace()?"Next":"Next Race"):"Quit Game",vsSet.race,raceCount());
-@@ -3014,7 +3245,8 @@ int main() {
+@@ -3014,7 +3265,8 @@ int main() {
              }
              profiler->mark(Profile::UiPrepare);
              if(fullRace&&!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))courseObjects.requestStadiumScreen(renderer);
@@ -826,7 +862,7 @@ index eebecbb..2815fca 100755
              {
                  // Fog follows the camera through KMP fog areas, one retail step per simulation step.
                  const unsigned steps=physicsSteps>retailFogSteps?physicsSteps-retailFogSteps:0;retailFogSteps=physicsSteps;
-@@ -3097,6 +3329,17 @@ int main() {
+@@ -3097,6 +3349,17 @@ int main() {
              // Snapshot the original chassis transform before the player pose
              // worker reads VehicleAnimation's lazy matrices.
              const C3D_Mtx playerShadowTransform=vehicleAnimation.body();
@@ -844,7 +880,7 @@ index eebecbb..2815fca 100755
              const bool playerBattleVisible=cameraKart->move()->battleVisible();
              // Native soft-wall contact distinguishes an entered snow shell
              // from the supporting ground underneath; ordinary offroad wheel
-@@ -3112,42 +3355,45 @@ int main() {
+@@ -3112,42 +3375,45 @@ int main() {
              bool objectSupport=cameraKart->collisionData().bHasRoadVel;
              for(unsigned w=0;w<vehicleAnimation.wheelCount();++w)
                  objectSupport|=cameraKart->collisionData(w).bHasRoadVel;
@@ -902,7 +938,7 @@ index eebecbb..2815fca 100755
              auto drawSkinned=[&](const mkw::DriverAnimation* bank,const mkw::Model& model,const C3D_Mtx& matrix){
                  if(bank&&bank->gpuSkinned())renderer.setSkinPalette(bank->palette(),bank->matrixCount(),21);
                  renderer.draw(model,matrix);
-@@ -3185,7 +3431,7 @@ int main() {
+@@ -3185,7 +3451,7 @@ int main() {
              if(coinRunnersMode){renderer.setCourseLighting(true);coinBattle.draw(renderer,physicsSteps);renderer.setCourseLighting(false);}
              if(battleMode&&!coinRunnersMode)balloonRuntime.draw(renderer);
              renderer.additiveColor=0;
@@ -911,7 +947,7 @@ index eebecbb..2815fca 100755
              renderer.setCourseLighting(true);
              Mtx_Identity(&transform);
              for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true);
-@@ -3241,9 +3487,9 @@ int main() {
+@@ -3241,9 +3507,9 @@ int main() {
                  const auto origin=vec(cameraKart->pos());
                  const mkw::Renderer::ShadowVolume fallback{vehicleShadow.get(),playerShadowTransform};
                  const auto& objectReceivers=courseObjects.shadowReceivers(origin,std::max(320.f,320.f*cameraKart->scale().y)*4.f);
@@ -923,7 +959,7 @@ index eebecbb..2815fca 100755
                  std::array<const mkw::Model*,256> receivers{};unsigned count=0;
                  for(const auto& model:track)if(count<receivers.size())receivers[count++]=model.get();
                  const auto& objects=courseObjects.shadowReceivers(lakitu.position(),2400.f);
-@@ -3251,18 +3497,19 @@ int main() {
+@@ -3251,30 +3517,39 @@ int main() {
                                    objects.data(),unsigned(objects.size()));
              }
              if(mergeJudgeShadow)renderer.setShadowUnion(false);
@@ -945,7 +981,11 @@ index eebecbb..2815fca 100755
  
                  raceHud.drawOverlay(renderer,*raceItems,unsigned(race->stage()),race->timer(),battleMode?battleRank(0):raceGrid.rank(),raceGrid.lap(),battleMode?battleTicks>=balloonBattle.durationTicks():raceGrid.finished(),physicsSteps,results.finishFrame(),results.hudSlide(),camera->lookingBack());
  }
-@@ -3270,11 +3517,15 @@ int main() {
+             renderer.setScreenDepth(renderer.stereoLayer(mkw::stereo::HudLayer));
++            if(netRace&&fullRace&&!netGo){ // waiting for consoles still loading
++                char waitLine[192];mkw::net::waitingText(waitLine,sizeof waitLine);
++                if(waitLine[0]){renderer.drawScreenFade(.45f,false);renderer.drawScreenText(waitLine,24,70,2.f,0xffffffffu);}
++            }
              if(fullRace)flowUi.drawResults(renderer,results,bottomScreen.miiPortrait());
              renderer.setScreenDepth(0);
              if(fullRace)flowUi.drawWipe(renderer,cameraDirector->wipeProgress());
@@ -963,7 +1003,7 @@ index eebecbb..2815fca 100755
                  // The lower LCD: the race read, never written (src/race_bottom_screen.cpp).
                  mkw::fillBottomView(bottomView,raceGrid,*raceItems,intro.active(),physicsSteps,results.leaveFade());
                  if(battleMode){
-@@ -3285,7 +3536,7 @@ int main() {
+@@ -3285,7 +3560,7 @@ int main() {
                  renderer.beginBottom();
                  bottomScreen.draw(renderer,bottomView);
              }
@@ -1036,21 +1076,22 @@ index 45cc671..3c51c74 100755
   case UiPage::BattleCup:
    if(selection.battleStage/5!=cursor)selection.battleStage=cursor*5;
 diff --git a/src/menu_ui.cpp b/src/menu_ui.cpp
-index 3fab23d..e8b0ec1 100755
+index 3fab23d..e54ab0c 100755
 --- a/src/menu_ui.cpp
 +++ b/src/menu_ui.cpp
-@@ -16,6 +16,10 @@
+@@ -16,6 +16,11 @@
  #include <cstring>
  
  namespace mkw {
 +const char* uiWirelessStatus=nullptr;
 +const char* uiWirelessLabels[2]={nullptr,nullptr};
 +// Every character the Local Wireless page can show, requested when the page is prepared.
-+const char* uiWirelessGlyphs="Local Wireless Host Join Leave Hosting - players Searching for a host... Joined as player Host not answering Host a race or join one Wireless error ABCDEF 0123456789 CPUs: On Off Players: Player Waiting for host 50cc 100cc 150cc Mirror START to begin";
++const char* uiWirelessGlyphs="Local Wireless Host Join Leave Hosting - players Searching for a host... Joined as player Host not answering Host a race or join one Wireless error ABCDEF 0123456789 CPUs: On Off Players: Player Waiting for host 50cc 100cc 150cc Mirror START to begin ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz?";
++// (also covers "New 3DS required", "Not available", "Local wireless needs a New 3DS")
  namespace {
  constexpr float XScale=display::MenuScaleX,YScale=display::MenuScaleY;
  constexpr const char* CupNames[]={"Mushroom Cup","Flower Cup","Star Cup","Special Cup","Shell Cup","Banana Cup","Leaf Cup","Lightning Cup"};
-@@ -294,7 +298,7 @@ public:
+@@ -294,7 +299,7 @@ public:
   }
   void textSprite(unsigned index,const UiPaneInfo& pane,Pose p,uint32_t color=0xffffffff){
    if(index>=std::size(UiSprites)||!pane.visible)return;
@@ -1059,7 +1100,7 @@ index 3fab23d..e8b0ec1 100755
     const char* caption=UiSprites[index].text;
     for(unsigned i=0;i<std::size(UiSprites);++i)
      if(!std::strncmp(UiSprites[i].key,"footer_caption_",15)&&!std::strcmp(UiSprites[i].text,caption)){index=i;break;}
-@@ -457,6 +461,29 @@ public:
+@@ -457,6 +462,29 @@ public:
    for(unsigned i=0;i<count;++i){auto cell=original;cell.x=x;cell.w=widths[i]*fit;cell.fontW*=fit;cell.fontH*=fit;cell.textAlign=0;
     textSprite(indices[i],cell,p);x+=cell.w;}
   }
@@ -1089,7 +1130,7 @@ index 3fab23d..e8b0ec1 100755
   void text(const char* text,const char* base,Pose p={},uint32_t tint=0xffffffff,const char* name="text"){
    const auto* r=pane(base,name);if(!r)return;
    if(layout.page==UiPage::LicenseSettings&&layout.role==UiMenuRole::Choice){optionText(text,*r,p);return;}
-@@ -657,12 +684,12 @@ public:
+@@ -657,12 +685,12 @@ public:
    auto key=buttonState(base,slot);panel(key.c_str(),p);
    if(caption){text(caption,key.c_str(),p);if(state.cursor==slot)glow(base,p,caption);}
   }
@@ -1105,7 +1146,7 @@ index 3fab23d..e8b0ec1 100755
    group(UiMenuRole::Content);
   }
   void timeTrialBest(){
-@@ -976,10 +1003,11 @@ static void composeMenuImpl(const MenuState& s,const UiRaceView& race,std::vecto
+@@ -976,10 +1004,11 @@ static void composeMenuImpl(const MenuState& s,const UiRaceView& race,std::vecto
    for(unsigned i=0;i<2;++i){Pose p=control("PadEasy",i==0?"ButtonEasy":"ButtonNormal",i);c.group(UiMenuRole::Choice,i,p,"drift_free");auto base=c.buttonState("drift",i);c.movieButton(base.c_str(),p);c.movie("drift_movie_",1-i,base.c_str(),"black_base",p);c.movieOverlay(base.c_str(),p);c.text(i==0?"Automatic":"Manual",base.c_str(),p);if(s.cursor==i)c.glow("drift",p,i==0?"Automatic":"Manual");}c.chrome("Drift",UiHelpDrift[std::min(s.cursor,1u)]);
    {Pose help=control("DriftHelp","DriftHelp",2);c.group(UiMenuRole::Auxiliary,0,help,"drift_help_free");auto helpBase=c.buttonState("drift_help",2);c.panel(helpBase.c_str(),help);c.text("Help",helpBase.c_str(),help);if(s.cursor==2)c.glow("drift_help",help,"Help");}break;
   case UiPage::VSMode:case UiPage::BattleMode:{
@@ -1121,7 +1162,7 @@ index 3fab23d..e8b0ec1 100755
   }
   case UiPage::TeamConfirm:{
    auto teams=offlineVsTeams(true,s.selection.humanTeam);unsigned slots[2]{};
-@@ -1356,6 +1384,7 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
+@@ -1356,6 +1385,7 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
   top.clear();bottom.clear();top.reserve(source.size());bottom.reserve(source.size());
   if(unchangedMenu(state.page)){top=source;for(auto& q:top)q.bottom=false;return;}
   const bool fullMovie=state.page==UiPage::Course||state.page==UiPage::BattleStage||state.page==UiPage::Confirm;
@@ -1129,7 +1170,7 @@ index 3fab23d..e8b0ec1 100755
   for(const auto& q:source){
    const auto& g=q.menu;const unsigned i=g.group;
    const bool upperConfirm=g.page==UiPage::Confirm;
-@@ -1376,6 +1405,12 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
+@@ -1376,6 +1406,12 @@ void layoutMenuScreens(const MenuState& state,const std::vector<UiQuad>& source,
     placeMenuQuad(q,{14,6,372,20},false,top,true);if(!upperConfirm)placeMenuQuad(q,{12,6,296,20},true,bottom,true);break;
    case UiMenuRole::Description:
     {auto text=q;const auto& a=UiSprites[q.sprite];
@@ -1144,10 +1185,10 @@ index 3fab23d..e8b0ec1 100755
      text.bottom=false;top.push_back(text);break;}
 diff --git a/src/netplay.cpp b/src/netplay.cpp
 new file mode 100644
-index 0000000..d33c2d3
+index 0000000..6b5a25d
 --- /dev/null
 +++ b/src/netplay.cpp
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,924 @@
 +// Local wireless VS races, 2 to 12 racers (see include/mkw/netplay.hpp).
 +#include <mkw/netplay.hpp>
 +#include <3ds.h>
@@ -1171,19 +1212,23 @@ index 0000000..d33c2d3
 +namespace {
 +constexpr u32 CommId = 0x4D4B5733;   // "MKW3": only this game's networks are seen.
 +constexpr u8 MaxNodes = 12;
++constexpr u8 HostChannel = 6;
++constexpr u32 WirelessCpuLimit = 40; // Old 3DS: % of the system core the game keeps during wireless play
 +constexpr unsigned MaxSlots = 12;    // link slot = UDS node ID - 1; the host is slot 0
 +constexpr unsigned MaxRacers = 12;   // race ID = grid position
 +constexpr u8 NoSlot = 0xff;          // a roster entry without a console: a CPU
 +constexpr u8 Channel = 1;
 +constexpr char Passphrase[] = "mkw-3ds local play v1";
 +constexpr u8 Magic = 0x6B;
-+constexpr u8 Protocol = 7;           // Bump when packets change: every console must match.
++constexpr u8 Protocol = 8;           // Bump when packets change: every console must match.
 +constexpr unsigned SendEvery = 3;    // ticks between kart updates: 20 a second
 +
-+enum class Type : u8 { Hello = 1, Start, Accept, Decline, Roster, Ready, Go, State, Bundle, Bye, Ping, Pong, Event, RaceOver, LobbyGo };
++enum class Type : u8 { Hello = 1, Start, Accept, Decline, Roster, Ready, Go, State, Bundle, Bye, Ping, Pong, Event, RaceOver, LobbyGo, Loading, Wait };
 +struct Header { u8 magic, protocol, type, count; u16 raceId, pad; };
 +struct StartPacket { Header h; u8 course, engineClass, mirror, items; };
 +struct AcceptPacket { Header h; u16 garage, pad; u16 name[10]; };
++struct LoadingPacket { Header h; u8 percent, pad[3]; };
++struct WaitPacket { Header h; u16 waiting; u8 percent[12]; u8 pad[2]; };
 +struct RosterEntry { u8 slot, pad; u16 garage; u16 name[10]; };
 +struct RosterPacket { Header h; RosterEntry e[MaxRacers]; };
 +struct PingPacket { Header h; u64 sentAt; };
@@ -1234,6 +1279,12 @@ index 0000000..d33c2d3
 +
 +// ---- Race ----
 +bool inRace_ = false, go_ = false, raceOver_ = false, lobbyGo_ = false;
++std::array<bool, 12> left_{};
++// Race loading: guests report progress while they load (heartbeat); the host waits
++// for them and tells everyone who is still loading.
++std::array<u64, 12> loadingSeen_{}; std::array<u8, 12> loadingPct_{};
++u16 waitMask_ = 0; std::array<u8, 12> waitPct_{}; u64 waitSeen_ = 0, lastWaitSend_ = 0;
++volatile unsigned loadStages_ = 0; volatile bool loadingBeat_ = false; Thread beatThread_ = nullptr;
 +std::array<bool, MaxSlots> ready_{};        // host: guests that loaded
 +struct Remote { bool have = false, haveOffset = false; KartState k{}; u64 arrival = 0; int minOffset = 0; };
 +std::array<Remote, MaxRacers> remotes_{};   // by race ID
@@ -1355,10 +1406,25 @@ index 0000000..d33c2d3
 +        }
 +        break;
 +    case Type::Ready:
-+        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots && !ready_[from]) { ready_[from] = true; log("guest %u loaded", from); }
++        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots) {
++            if (!ready_[from]) { ready_[from] = true; log("guest %u loaded", from); }
++            if (goSentAt_) { const Header go = header(Type::Go); sendTo(u16(from + 1), &go, sizeof go); } // loaded after the start
++        }
 +        break;
 +    case Type::Go:
 +        if (role_ == Role::Guest && h.raceId == raceId_ && !go_) { go_ = true; log("go race=%u", raceId_); }
++        break;
++    case Type::Loading:
++        if (role_ == Role::Host && h.raceId == raceId_ && from < MaxSlots && size >= sizeof(LoadingPacket)) {
++            LoadingPacket p; std::memcpy(&p, data, sizeof p);
++            loadingSeen_[from] = now(); loadingPct_[from] = p.percent; guestLastRecv_[from] = now();
++        }
++        break;
++    case Type::Wait:
++        if (role_ == Role::Guest && h.raceId == raceId_ && inRace_ && size >= sizeof(WaitPacket)) {
++            WaitPacket p; std::memcpy(&p, data, sizeof p);
++            waitMask_ = p.waiting; std::memcpy(waitPct_.data(), p.percent, sizeof p.percent); waitSeen_ = now();
++        }
 +        break;
 +    case Type::LobbyGo:
 +        if (role_ == Role::Guest && !inRace_ && !lobbyGo_) { lobbyGo_ = true; log("lobby go"); }
@@ -1369,6 +1435,7 @@ index 0000000..d33c2d3
 +    case Type::State:
 +        if (role_ == Role::Host && inRace_ && h.raceId == raceId_ && size >= sizeof(StatePacket)) {
 +            StatePacket p; std::memcpy(&p, data, sizeof p);
++            if (from < MaxSlots && !ready_[from]) { ready_[from] = true; log("guest %u racing: loaded", from); }
 +            const int racer = racerOfSlot(from); // trust the link, not the packet
 +            if (racer < 0) break;
 +            p.k.racer = u8(racer);
@@ -1379,6 +1446,7 @@ index 0000000..d33c2d3
 +        if (role_ == Role::Guest && inRace_ && h.raceId == raceId_ && h.count <= MaxRacers &&
 +            size >= sizeof(Header) + h.count * sizeof(KartState)) {
 +            BundlePacket p; std::memcpy(&p, data, std::min(size, sizeof p));
++            if (!go_ && readyWaitStart_) { go_ = true; log("host is racing: go"); } // a lost Go: the host's karts are moving
 +            for (unsigned i = 0; i < h.count; ++i) storeRemote(p.k[i]);
 +        }
 +        break;
@@ -1404,7 +1472,7 @@ index 0000000..d33c2d3
 +        }
 +        break;
 +    case Type::Bye:
-+        if (role_ == Role::Host && from < MaxSlots) { guestLastRecv_[from] = 0; log("guest %u left", from); }
++        if (role_ == Role::Host && from < MaxSlots) { guestLastRecv_[from] = 0; left_[from] = true; log("guest %u left", from); }
 +        else if (role_ == Role::Guest) { hostLastRecv_ = 0; log("host left"); }
 +        break;
 +    }
@@ -1418,7 +1486,8 @@ index 0000000..d33c2d3
 +
 +void stopUds() {
 +    if (!up_) return;
-+    sendSimple(Type::Bye);
++    // A single goodbye just before the network closes is easily lost: repeat it.
++    for (int i = 0; i < 4; ++i) { sendSimple(Type::Bye); svcSleepThread(15 * 1000000LL); }
 +    if (role_ == Role::Host) udsDestroyNetwork(); else udsDisconnectNetwork();
 +    udsUnbind(&bind_);
 +    up_ = false;
@@ -1431,15 +1500,37 @@ index 0000000..d33c2d3
 +    log("node %u slot %u", myNode_, mySlot_);
 +}
 +
++void shareSystemCore(bool wireless);
++constexpr unsigned ExpectedLoadStages = 12; // race-load stage() calls, for a rough percentage
++void beatMain(void*) {
++    while (loadingBeat_) {
++        LoadingPacket p{}; p.h = header(Type::Loading);
++        p.percent = u8(std::min(99u, loadStages_ * 100u / ExpectedLoadStages));
++        send(&p, sizeof p);
++        for (int i = 0; i < 10 && loadingBeat_; ++i) svcSleepThread(100 * 1000000LL);
++    }
++}
++void stopBeat() {
++    loadingBeat_ = false;
++    if (beatThread_) { threadJoin(beatThread_, U64_MAX); threadFree(beatThread_); beatThread_ = nullptr; }
++}
 +void beginRace() {
 +    // Racer 0 is this console; the others follow in grid order.
 +    const int me = racerOfSlot(mySlot_); myRacer_ = me >= 0 ? unsigned(me) : 0;
 +    unsigned n = 1; indexRacer_[0] = u8(myRacer_); racerIndex_[myRacer_] = 0;
 +    for (unsigned r = 0; r < rosterCount_ && n < MaxRacers; ++r) if (r != myRacer_) { indexRacer_[n] = u8(r); racerIndex_[r] = u8(n); ++n; }
-+    inRace_ = true; go_ = false; raceOver_ = false; hostLost_ = false; ready_.fill(false); remotes_ = {};
++    inRace_ = true; go_ = false; raceOver_ = false; hostLost_ = false; ready_.fill(false); left_.fill(false); remotes_ = {};
++    loadingSeen_.fill(0); loadingPct_.fill(0); waitMask_ = 0; waitSeen_ = lastWaitSend_ = 0; loadStages_ = 0;
 +    localTick_ = 0; havePrev_ = false; itemBits_.fill(0); readyWaitStart_ = 0; lastReadySend_ = 0; goSentAt_ = 0; goRepeats_ = 0;
 +    eventSeq_ = 0; haveSeq_.fill(false); newsHead_ = newsCount_ = 0;
 +    log("race %u begins: %u racers, this console is racer %u", raceId_, rosterCount_, myRacer_);
++    shareSystemCore(false); // Old 3DS: racing needs the full render share; race traffic is light
++    if (!beatThread_) { // both roles: a console that is loading still says so
++        loadingBeat_ = true;
++        s32 priority = 0x30; svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
++        beatThread_ = threadCreate(beatMain, nullptr, 0x2000, int(std::max<s32>(priority - 1, 0x18)), -2, false);
++        if (!beatThread_) loadingBeat_ = false;
++    }
 +    logHold_ = true;
 +}
 +
@@ -1449,28 +1540,90 @@ index 0000000..d33c2d3
 +Thread startThread_ = nullptr;
 +char status_[96] = "";
 +Thread scanThread_ = nullptr; volatile bool scanStop_ = false;
++volatile unsigned scans_ = 0, hostsSeen_ = 0, joinTry_ = 0; volatile u32 joinError_ = 0; // shown while searching
++// Hosts in range (from the last scan), for the guest to choose from.
++struct HostEntry { udsNetworkStruct network; char name[12]; u8 players, max, channel; };
++constexpr unsigned MaxHosts = 8;
++HostEntry hosts_[MaxHosts]; unsigned hostCount_ = 0; LightLock hostsLock_;
++volatile int joinRequest_ = -1;
++bool connectTo(const udsNetworkStruct& network, u32 recvBuffer) {
++    const Result r = udsConnectNetwork(&network, Passphrase, sizeof Passphrase, &bind_,
++                                       UDS_BROADCAST_NETWORKNODEID, UDSCONTYPE_Client, Channel, recvBuffer);
++    if (R_SUCCEEDED(r)) { learnNode(); hostLastRecv_ = now(); up_ = true; joining_ = false; joinError_ = 0; log("joined (menu)"); return true; }
++    joinError_ = u32(r); log("udsConnectNetwork %08lx (try %u, buffer %lx)", (unsigned long)r, unsigned(joinTry_), (unsigned long)recvBuffer);
++    return false;
++}
 +void scanOnce() {
 +    static u8 scan[0x4000];
 +    udsNetworkScanInfo* networks = nullptr; size_t total = 0;
 +    Result r = udsScanBeacons(scan, sizeof scan, &networks, &total, CommId, 0, nullptr, false);
-+    if (R_SUCCEEDED(r) && total) {
-+        r = udsConnectNetwork(&networks[0].network, Passphrase, sizeof Passphrase, &bind_,
-+                              UDS_BROADCAST_NETWORKNODEID, UDSCONTYPE_Client, Channel, UDS_DEFAULT_RECVBUFSIZE);
-+        if (R_SUCCEEDED(r)) { learnNode(); hostLastRecv_ = now(); up_ = true; joining_ = false; log("joined (menu)"); }
-+        else log("udsConnectNetwork %08lx", (unsigned long)r);
++    ++scans_;
++    if (R_FAILED(r)) { joinError_ = u32(r); log("udsScanBeacons %08lx", (unsigned long)r); }
++    else {
++        hostsSeen_ = unsigned(total);
++        HostEntry found[MaxHosts]; unsigned n = 0;
++        for (size_t i = 0; i < total && n < MaxHosts; ++i) {
++            HostEntry& e = found[n++]; e.network = networks[i].network;
++            size_t got = 0; std::memset(e.name, 0, sizeof e.name);
++            if (R_FAILED(udsGetNetworkStructApplicationData(&e.network, e.name, sizeof e.name - 1, &got)) || !got || !e.name[0])
++                std::snprintf(e.name, sizeof e.name, "Host %u", unsigned(n));
++            e.players = e.network.total_nodes; e.max = e.network.max_nodes; e.channel = e.network.channel;
++        }
++        LightLock_Lock(&hostsLock_); std::memcpy(hosts_, found, sizeof(HostEntry) * n); hostCount_ = n; LightLock_Unlock(&hostsLock_);
 +    }
 +    free(networks);
 +}
 +bool startUds();
 +void scanMain(void*) {
 +    if (!udsReady_ && !startUds()) { joining_ = false; return; }
-+    while (!scanStop_ && joining_ && !up_) { scanOnce(); for (int i = 0; i < 10 && !scanStop_; ++i) svcSleepThread(50 * 1000000LL); }
++    while (!scanStop_ && joining_ && !up_) {
++        const int want = joinRequest_;
++        if (want >= 0) {
++            joinRequest_ = -1;
++            udsNetworkStruct network{}; bool have = false;
++            LightLock_Lock(&hostsLock_); if (unsigned(want) < hostCount_) { network = hosts_[want].network; have = true; } LightLock_Unlock(&hostsLock_);
++            if (have) {
++                // Try the beacon as scanned, then a fresh scan of the same host,
++                // then a fresh scan with a smaller receive buffer.
++                u8 mac[6]; std::memcpy(mac, network.host_macaddress, 6);
++                for (unsigned attempt = 0; attempt < 3 && !up_ && !scanStop_; ++attempt) {
++                    joinTry_ = attempt + 1;
++                    if (attempt) {
++                        scanOnce();
++                        LightLock_Lock(&hostsLock_);
++                        for (unsigned i = 0; i < hostCount_; ++i) if (!std::memcmp(hosts_[i].network.host_macaddress, mac, 6)) network = hosts_[i].network;
++                        LightLock_Unlock(&hostsLock_);
++                    }
++                    if (connectTo(network, attempt == 2 ? 0x1000 : UDS_DEFAULT_RECVBUFSIZE)) break;
++                    svcSleepThread(1500 * 1000000LL);
++                }
++            }
++            continue;
++        }
++        scanOnce();
++        for (int i = 0; i < 10 && !scanStop_ && joinRequest_ < 0; ++i) svcSleepThread(50 * 1000000LL);
++    }
 +}
 +void stopScan() {
 +    if (!scanThread_) return;
 +    scanStop_ = true; threadJoin(scanThread_, U64_MAX); threadFree(scanThread_); scanThread_ = nullptr;
 +}
++// Old 3DS / 2DS: the game's render thread shares the system core (core 1), where it
++// is granted 80% of the time. The wireless service runs there too and, starved,
++// scans slowly and lets connection handshakes time out (cancelled joins). While a
++// wireless session is open the game keeps a smaller share; shutdown() restores it.
++u32 savedCpuLimit_ = 0;
++void shareSystemCore(bool wireless) {
++    bool n3ds = false; APT_CheckNew3DS(&n3ds);
++    if (n3ds) return;
++    if (wireless) {
++        if (!savedCpuLimit_ && R_SUCCEEDED(APT_GetAppCpuTimeLimit(&savedCpuLimit_)) && savedCpuLimit_ > WirelessCpuLimit) {
++            APT_SetAppCpuTimeLimit(WirelessCpuLimit); log("system core: %lu%% -> %lu%% for wireless", (unsigned long)savedCpuLimit_, (unsigned long)WirelessCpuLimit);
++        }
++    } else if (savedCpuLimit_) { APT_SetAppCpuTimeLimit(savedCpuLimit_); savedCpuLimit_ = 0; }
++}
 +bool startUds() {
++    shareSystemCore(true);
 +    const Result r = udsInit(0x3000, nullptr);
 +    if (R_SUCCEEDED(r)) { udsReady_ = true; return true; }
 +    log("udsInit %08lx", (unsigned long)r);
@@ -1505,6 +1658,14 @@ index 0000000..d33c2d3
 +        handle(buffer, actual, source);
 +    }
 +    maxBatch_ = std::max(maxBatch_, batch);
++    // Lobby guest whose host left (goodbye received, or silent for 4 s): end the
++    // session so the guest can search and join again.
++    if (role_ == Role::Guest && !inRace_ && (!hostLastRecv_ || now() - hostLastRecv_ > ms(4000))) {
++        log("host gone (lobby)");
++        shutdown();
++        snprintf(status_, sizeof status_, "Host left");
++        return;
++    }
 +    if (now() - lastHello_ > ms(1000)) { lastHello_ = now(); sendSimple(Type::Hello); }
 +    if (now() - lastPing_ > ms(500)) { lastPing_ = now(); PingPacket p{}; p.h = header(Type::Ping); p.sentAt = now(); send(&p, sizeof p); }
 +}
@@ -1554,11 +1715,22 @@ index 0000000..d33c2d3
 +    if (!udsReady_ && !startUds()) { starting_ = false; return; }
 +    udsNetworkStruct network;
 +    udsGenerateDefaultNetworkStruct(&network, CommId, 0, MaxNodes);
++    // A fixed channel every region allows (1, 6, 11): left at 0 the system picks
++    // one, and a channel allowed only in the host's region can be heard by, but
++    // not joined from, consoles of other regions.
++    network.channel = HostChannel;
 +    const Result r = udsCreateNetwork(&network, Passphrase, sizeof Passphrase, &bind_, Channel, UDS_DEFAULT_RECVBUFSIZE);
 +    if (R_FAILED(r)) {
 +        log("udsCreateNetwork %08lx", (unsigned long)r);
 +        snprintf(status_, sizeof status_, "Wireless error %08lX", (unsigned long)r);
-+    } else { learnNode(); up_ = true; log("hosting"); }
++    } else {
++        // The beacon carries the host's license name for the guests' host list.
++        char name[12] = {}; unsigned n = 0;
++        for (unsigned i = 0; i < myName_.size() && myName_[i] && n < 10; ++i) name[n++] = myName_[i] >= 32 && myName_[i] < 127 ? char(myName_[i]) : '?';
++        if (!n) std::strcpy(name, "Host");
++        udsSetApplicationData(name, std::strlen(name) + 1);
++        learnNode(); up_ = true; log("hosting");
++    }
 +    starting_ = false;
 +}
 +void hostBegin() {
@@ -1576,6 +1748,7 @@ index 0000000..d33c2d3
 +    if (!exitHooked_) { exitHooked_ = true; atexit(shutdown); }
 +    resetLink();
 +    role_ = Role::Guest; joining_ = true; scanStop_ = false;
++    LightLock_Init(&hostsLock_); hostCount_ = 0; joinRequest_ = -1; scans_ = hostsSeen_ = joinTry_ = 0; joinError_ = 0;
 +    s32 priority = 0x30; svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
 +    scanThread_ = threadCreate(scanMain, nullptr, 0x4000, int(std::min<s32>(priority + 1, 0x3F)), -2, false);
 +    if (!scanThread_) { log("scan thread failed"); joining_ = false; shutdown(); }
@@ -1590,16 +1763,22 @@ index 0000000..d33c2d3
 +        snprintf(status_, sizeof status_, n > 1 ? "Hosting - %u players - START to begin" : "Hosting - %u player", n);
 +        return status_;
 +    }
-+    if (joining_ || !up_) return "Searching for a host...";
++    if (joining_ || !up_) {
++        // Diagnostics while searching: scans done, hosts seen, and the last wireless error.
++        if (joinError_) snprintf(status_, sizeof status_, "Searching %u - %u - try %u - Wireless error %08lX", unsigned(scans_), unsigned(hostsSeen_), unsigned(joinTry_), (unsigned long)joinError_);
++        else snprintf(status_, sizeof status_, "Searching for a host... %u - %u", unsigned(scans_), unsigned(hostsSeen_));
++        return status_;
++    }
 +    snprintf(status_, sizeof status_, connected() ? "Joined as player %u" : "Host not answering", mySlot_ + 1);
 +    return status_;
 +}
 +
 +void shutdown() {
 +    if (role_ == Role::None) return;
-+    joining_ = false; stopScan();
++    joining_ = false; stopScan(); stopBeat();
 +    if (startThread_) { threadJoin(startThread_, U64_MAX); threadFree(startThread_); startThread_ = nullptr; starting_ = false; }
 +    stopUds(); if (udsReady_) { udsExit(); udsReady_ = false; }
++    shareSystemCore(false);
 +    role_ = Role::None;
 +    flushLog();
 +}
@@ -1694,18 +1873,35 @@ index 0000000..d33c2d3
 +
 +bool raceReady() {
 +    if (!inRace_) return true;
++    if (beatThread_) stopBeat(); // loaded: Ready packets take over from the loading heartbeat
 +    poll();
 +    if (!readyWaitStart_) readyWaitStart_ = now();
-+    const bool timedOut = now() - readyWaitStart_ > ms(60000);
++    const bool timedOut = now() - readyWaitStart_ > ms(180000);
 +    if (role_ == Role::Guest) {
 +        if (now() - lastReadySend_ > ms(250)) { lastReadySend_ = now(); sendSimple(Type::Ready); }
-+        if (go_ || timedOut) { log(go_ ? "go after %.1f s" : "no go: racing anyway", double(now() - readyWaitStart_) / SYSCLOCK_ARM11); return true; }
++        // A host silent for 6 s while we wait has left: race on, driving the other karts.
++        const bool hostGone = now() - readyWaitStart_ > ms(20000) && hostLastRecv_ && now() - hostLastRecv_ > ms(10000);
++        if (go_ || timedOut || hostGone) { log(go_ ? "go after %.1f s" : "no go: racing anyway", double(now() - readyWaitStart_) / SYSCLOCK_ARM11); go_ = true; return true; }
 +        return false;
 +    }
 +    // Host: go when every guest has loaded (one that left is not waited for).
 +    bool all = true;
-+    for (unsigned r = 1; r < rosterCount_; ++r) { const unsigned s = rosterSlot_[r]; if (s != NoSlot && !ready_[s] && guestAlive(s)) all = false; }
++    // A guest is silent while it loads (slow on Old 3DS): wait for it unless it said goodbye.
++    // Waited for: not loaded, not gone, and either heard from (loading heartbeat) in
++    // the last 10 s or still within the first 20 s.
++    u16 waiting = 0; WaitPacket wait{}; wait.h = header(Type::Wait);
++    const bool early = now() - readyWaitStart_ < ms(20000);
++    for (unsigned r = 1; r < rosterCount_; ++r) {
++        const unsigned s = rosterSlot_[r];
++        if (s == NoSlot || s >= MaxSlots || ready_[s] || left_[s]) continue;
++        const u64 heard = std::max(loadingSeen_[s], guestLastRecv_[s]);
++        if (!early && (!heard || now() - heard > ms(10000))) continue; // stopped answering
++        waiting |= u16(1u << r); wait.percent[r] = loadingPct_[s]; all = false;
++    }
++    waitMask_ = waiting; for (unsigned r = 0; r < 12; ++r) waitPct_[r] = wait.percent[r];
++    if (now() - lastWaitSend_ > ms(500)) { lastWaitSend_ = now(); wait.waiting = waiting; send(&wait, sizeof wait); }
 +    if (!all && !timedOut) return false;
++    waitMask_ = 0;
 +    const Header go = header(Type::Go);
 +    for (int i = 0; i < 3; ++i) send(&go, sizeof go);
 +    goSentAt_ = now(); goRepeats_ = 8; // repeated a few times early in the race, in case one is lost
@@ -1816,8 +2012,24 @@ index 0000000..d33c2d3
 +    send(&b, sizeof(Header) + n * sizeof(KartState));
 +}
 +
++void loadStage() { if (inRace_ && !readyWaitStart_) ++loadStages_; }
++void waitingText(char* out, size_t size) {
++    out[0] = 0;
++    if (!inRace_ || go_ || goSentAt_ || !readyWaitStart_) return;
++    if (role_ == Role::Guest && (!waitSeen_ || now() - waitSeen_ > ms(2000))) { snprintf(out, size, "WAITING FOR THE HOST"); return; }
++    size_t used = snprintf(out, size, "WAITING FOR:");
++    for (unsigned r = 0; r < rosterCount_ && r < 12 && used < size; ++r) {
++        if (!(waitMask_ & (1u << r))) continue;
++        char name[12] = {}; unsigned n = 0;
++        for (unsigned i = 0; i < 10 && rosterName_[r][i] && n < 10; ++i) { const u16 c = rosterName_[r][i]; name[n++] = c < 128 ? char(c) : '?'; }
++        if (!n) snprintf(name, sizeof name, "PLAYER %u", r + 1);
++        used += snprintf(out + used, size - used, waitPct_[r] ? "\n%s - LOADING %u" : "\n%s", name, unsigned(waitPct_[r]));
++    }
++}
 +void endRace() {
++    stopBeat();
 +    if (inRace_) log("race %u ends", raceId_);
++    if (inRace_ && up_) shareSystemCore(true); // back in the lobby: room for the wireless service again
 +    inRace_ = false; go_ = false; raceOver_ = false;
 +}
 +
@@ -1826,6 +2038,17 @@ index 0000000..d33c2d3
 +    const Header h = header(Type::RaceOver);
 +    for (int i = 0; i < 4; ++i) send(&h, sizeof h);
 +}
++unsigned hostCount() {
++    if (role_ != Role::Guest || up_) return 0;
++    LightLock_Lock(&hostsLock_); const unsigned n = hostCount_; LightLock_Unlock(&hostsLock_); return n;
++}
++void hostLabel(unsigned index, char* out, size_t size) {
++    out[0] = 0;
++    LightLock_Lock(&hostsLock_);
++    if (index < hostCount_) { const auto& h = hosts_[index]; std::snprintf(out, size, "%s - %u player%s - ch %u", h.name, unsigned(h.players), h.players == 1 ? "" : "s", unsigned(h.channel)); }
++    LightLock_Unlock(&hostsLock_);
++}
++void joinHost(unsigned index) { if (role_ == Role::Guest && !up_ && joining_) joinRequest_ = int(index); }
 +void hostLobbyGo() {
 +    if (role_ != Role::Host || inRace_) return;
 +    const Header h = header(Type::LobbyGo);
@@ -1884,8 +2107,9 @@ index 0000000..d33c2d3
 +        if (!r.have) continue;
 +        ++live; worstAge = std::max(worstAge, toMs(now() - r.arrival));
 +    }
-+    snprintf(out, size, "%s P%u %s n%u live%u age%u rtt%u/%u tx%u f%u rx%u b%u",
-+             role_ == Role::Host ? "H" : "G", mySlot_ + 1, inRace_ ? "IN" : "--", inRace_ ? rosterCount_ : 0, live, worstAge,
++    u32 cpu = 0; APT_GetAppCpuTimeLimit(&cpu);
++    snprintf(out, size, "%s P%u cpu%lu %s n%u live%u age%u rtt%u/%u tx%u f%u rx%u b%u",
++             role_ == Role::Host ? "H" : "G", mySlot_ + 1, (unsigned long)cpu, inRace_ ? "IN" : "--", inRace_ ? rosterCount_ : 0, live, worstAge,
 +             rttMs_, rttMinMs_ == ~0u ? 0u : rttMinMs_, sent_, sendFails_, received_, maxBatch_);
 +}
 +} // namespace mkw::net

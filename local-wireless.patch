@@ -39,10 +39,10 @@ index 3d2b967..ec4b257 100755
   std::array<unsigned,10> battleStageDeck{};unsigned battleStageIndex=0;
 diff --git a/include/mkw/netplay.hpp b/include/mkw/netplay.hpp
 new file mode 100644
-index 0000000..51f6153
+index 0000000..3861597
 --- /dev/null
 +++ b/include/mkw/netplay.hpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,98 @@
 +#pragma once
 +// Local wireless (UDS: console to console, no access point) VS races, 2 to 12 racers.
 +// Star layout: guests talk only to the host; the host bundles every kart into one packet.
@@ -110,6 +110,8 @@ index 0000000..51f6153
 +// Race loading: a load step finished (progress for the others' waiting text), and the
 +// text to show while the race waits for consoles still loading (empty when not waiting).
 +void loadStage();
++// Race clock: the physics step count, every frame before applyRemotes/sendLocal.
++void setTick(uint32_t physicsTick);
 +void waitingText(char* out, std::size_t size);
 +// Joining: hosts in range (license name and players), and the guest's choice.
 +unsigned hostCount();
@@ -381,7 +383,7 @@ index 4a81834..0ac92ad 100755
                                    m.shadow?&fallback:nullptr,objects,objectCount,true);
      else if(m.shadow)renderer.drawShadowVolumes(&fallback,1,.5f);
 diff --git a/src/main.cpp b/src/main.cpp
-index eebecbb..60359d9 100755
+index eebecbb..44ec6da 100755
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -28,6 +28,8 @@
@@ -797,17 +799,18 @@ index eebecbb..60359d9 100755
                      for(unsigned i=0;i<raceGrid.count();++i){
                          const auto& h=raceItems->hud(i);const bool held=h.deployed&&h.heldCharges>0;
                          raceGrid.ai().setItemView(i,{uint8_t(h.item),uint8_t(held?h.heldCharges:0),h.roulette!=0,held,
-@@ -2319,7 +2537,9 @@ int main() {
+@@ -2319,7 +2537,10 @@ int main() {
                  }
                  // QA: a fall boundary (variant 0) activation, so the retail SetCamera hold applies.
                  if(autoplay&&lakituRespawnStep&&physicsSteps==lakituRespawnStep){auto* qaCollide=K::Kart::KartObjectManager::Instance()->object(0)->collide();qaCollide->setOobCameraPending(uint16_t(lakituRequest));qaCollide->activateOob(false,nullptr,false,false);}
-+                if(netRace&&fullRace)mkw::net::applyRemotes();
++                if(netRace&&fullRace){mkw::net::setTick(physicsSteps);mkw::net::applyRemotes();}
                  scenes.calc();
++                if(netRace&&fullRace)mkw::net::setTick(physicsSteps);
 +                if(netRace&&fullRace)mkw::net::sendLocal(K::Kart::KartObjectManager::Instance()->object(0),buttons,unsigned((selectedMirror?-stick:stick)+7),unsigned(raceTrick),raceGrid.finished());
                  {
                      // The player's driver model after the kart step: its trick animation,
                      // sparkle and sound start together (trick_presentation.hpp).
-@@ -2330,6 +2550,36 @@ int main() {
+@@ -2330,6 +2551,36 @@ int main() {
                  if(intro.active()&&!raceWarmupFrames){intro.step();++introTick;if(!intro.active())endIntro();}
                  if(fullRace){
                      raceGrid.afterStep();raceItems->afterStepNative(raceGrid.count());
@@ -844,7 +847,7 @@ index eebecbb..60359d9 100755
                      if(coinRunnersMode){
                          const auto* race=K::System::RaceManager::Instance();
                          coinBattle.step(race->isStageReached(K::System::RaceManager::Stage::Race)&&
-@@ -2440,6 +2690,7 @@ int main() {
+@@ -2440,6 +2691,7 @@ int main() {
                          }
                          if(events&Flow::EventMenuShown){menu.finish(results.finalRace());raceEvents.emit(mkw::RaceEvent::MenuShown,physicsSteps,int(results.buttonCount()));}
                          if(events&Flow::EventOptionChosen){
@@ -852,7 +855,7 @@ index eebecbb..60359d9 100755
                              mkw::SoundSystem::instance().play(mkw::snd::id::SE_RC_PAUSE_EXIT_GAME,0);
                              raceEvents.emit(mkw::RaceEvent::OptionChosen,physicsSteps,results.chosen());
                              LOGF("race end option %s (race %u/%u)",results.chosen()==0?(results.finalRace()?"Next":"Next Race"):"Quit Game",vsSet.race,raceCount());
-@@ -3014,7 +3265,8 @@ int main() {
+@@ -3014,7 +3266,8 @@ int main() {
              }
              profiler->mark(Profile::UiPrepare);
              if(fullRace&&!effectsTest&&(int(Courses[courseChoice].id)==18||int(Courses[courseChoice].id)==6||int(Courses[courseChoice].id)==35))courseObjects.requestStadiumScreen(renderer);
@@ -862,7 +865,7 @@ index eebecbb..60359d9 100755
              {
                  // Fog follows the camera through KMP fog areas, one retail step per simulation step.
                  const unsigned steps=physicsSteps>retailFogSteps?physicsSteps-retailFogSteps:0;retailFogSteps=physicsSteps;
-@@ -3097,6 +3349,17 @@ int main() {
+@@ -3097,6 +3350,17 @@ int main() {
              // Snapshot the original chassis transform before the player pose
              // worker reads VehicleAnimation's lazy matrices.
              const C3D_Mtx playerShadowTransform=vehicleAnimation.body();
@@ -880,7 +883,7 @@ index eebecbb..60359d9 100755
              const bool playerBattleVisible=cameraKart->move()->battleVisible();
              // Native soft-wall contact distinguishes an entered snow shell
              // from the supporting ground underneath; ordinary offroad wheel
-@@ -3112,42 +3375,45 @@ int main() {
+@@ -3112,42 +3376,45 @@ int main() {
              bool objectSupport=cameraKart->collisionData().bHasRoadVel;
              for(unsigned w=0;w<vehicleAnimation.wheelCount();++w)
                  objectSupport|=cameraKart->collisionData(w).bHasRoadVel;
@@ -938,7 +941,7 @@ index eebecbb..60359d9 100755
              auto drawSkinned=[&](const mkw::DriverAnimation* bank,const mkw::Model& model,const C3D_Mtx& matrix){
                  if(bank&&bank->gpuSkinned())renderer.setSkinPalette(bank->palette(),bank->matrixCount(),21);
                  renderer.draw(model,matrix);
-@@ -3185,7 +3451,7 @@ int main() {
+@@ -3185,7 +3452,7 @@ int main() {
              if(coinRunnersMode){renderer.setCourseLighting(true);coinBattle.draw(renderer,physicsSteps);renderer.setCourseLighting(false);}
              if(battleMode&&!coinRunnersMode)balloonRuntime.draw(renderer);
              renderer.additiveColor=0;
@@ -947,7 +950,7 @@ index eebecbb..60359d9 100755
              renderer.setCourseLighting(true);
              Mtx_Identity(&transform);
              for(auto& model:track)drawCourseLayer(renderer,*model,transform,int(Courses[courseChoice].id),true);
-@@ -3241,9 +3507,9 @@ int main() {
+@@ -3241,9 +3508,9 @@ int main() {
                  const auto origin=vec(cameraKart->pos());
                  const mkw::Renderer::ShadowVolume fallback{vehicleShadow.get(),playerShadowTransform};
                  const auto& objectReceivers=courseObjects.shadowReceivers(origin,std::max(320.f,320.f*cameraKart->scale().y)*4.f);
@@ -959,7 +962,7 @@ index eebecbb..60359d9 100755
                  std::array<const mkw::Model*,256> receivers{};unsigned count=0;
                  for(const auto& model:track)if(count<receivers.size())receivers[count++]=model.get();
                  const auto& objects=courseObjects.shadowReceivers(lakitu.position(),2400.f);
-@@ -3251,30 +3517,39 @@ int main() {
+@@ -3251,30 +3518,39 @@ int main() {
                                    objects.data(),unsigned(objects.size()));
              }
              if(mergeJudgeShadow)renderer.setShadowUnion(false);
@@ -1003,7 +1006,7 @@ index eebecbb..60359d9 100755
                  // The lower LCD: the race read, never written (src/race_bottom_screen.cpp).
                  mkw::fillBottomView(bottomView,raceGrid,*raceItems,intro.active(),physicsSteps,results.leaveFade());
                  if(battleMode){
-@@ -3285,7 +3560,7 @@ int main() {
+@@ -3285,7 +3561,7 @@ int main() {
                  renderer.beginBottom();
                  bottomScreen.draw(renderer,bottomView);
              }
@@ -1185,10 +1188,10 @@ index 3fab23d..e54ab0c 100755
      text.bottom=false;top.push_back(text);break;}
 diff --git a/src/netplay.cpp b/src/netplay.cpp
 new file mode 100644
-index 0000000..6b5a25d
+index 0000000..7c4690c
 --- /dev/null
 +++ b/src/netplay.cpp
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,934 @@
 +// Local wireless VS races, 2 to 12 racers (see include/mkw/netplay.hpp).
 +#include <mkw/netplay.hpp>
 +#include <3ds.h>
@@ -1288,7 +1291,8 @@ index 0000000..6b5a25d
 +std::array<bool, MaxSlots> ready_{};        // host: guests that loaded
 +struct Remote { bool have = false, haveOffset = false; KartState k{}; u64 arrival = 0; int minOffset = 0; };
 +std::array<Remote, MaxRacers> remotes_{};   // by race ID
-+u32 localTick_ = 0;
++u32 localTick_ = 0;            // physics ticks since this race began (same 60 Hz clock on every console)
++u32 tickBase_ = ~0u, lastSendTick_ = 0;
 +std::array<std::array<float, 3>, MaxRacers> prevPos_{}; bool havePrev_ = false; // by racer index (owned ones)
 +std::array<u8, MaxRacers> itemBits_{};      // by racer index: buttons since the last update (use is OR-ed)
 +u64 readyWaitStart_ = 0, lastReadySend_ = 0, goSentAt_ = 0; unsigned goRepeats_ = 0;
@@ -1521,7 +1525,7 @@ index 0000000..6b5a25d
 +    for (unsigned r = 0; r < rosterCount_ && n < MaxRacers; ++r) if (r != myRacer_) { indexRacer_[n] = u8(r); racerIndex_[r] = u8(n); ++n; }
 +    inRace_ = true; go_ = false; raceOver_ = false; hostLost_ = false; ready_.fill(false); left_.fill(false); remotes_ = {};
 +    loadingSeen_.fill(0); loadingPct_.fill(0); waitMask_ = 0; waitSeen_ = lastWaitSend_ = 0; loadStages_ = 0;
-+    localTick_ = 0; havePrev_ = false; itemBits_.fill(0); readyWaitStart_ = 0; lastReadySend_ = 0; goSentAt_ = 0; goRepeats_ = 0;
++    localTick_ = 0; tickBase_ = ~0u; lastSendTick_ = 0; havePrev_ = false; itemBits_.fill(0); readyWaitStart_ = 0; lastReadySend_ = 0; goSentAt_ = 0; goRepeats_ = 0;
 +    eventSeq_ = 0; haveSeq_.fill(false); newsHead_ = newsCount_ = 0;
 +    log("race %u begins: %u racers, this console is racer %u", raceId_, rosterCount_, myRacer_);
 +    shareSystemCore(false); // Old 3DS: racing needs the full render share; race traffic is light
@@ -1950,6 +1954,12 @@ index 0000000..6b5a25d
 +        kart->setRot(kart->fullRot().slerpTo(rot, 0.15f));
 +        const float speed = kart->move()->speed();
 +        kart->move()->setSpeed(speed + (k.speed / 64.f - speed) * 0.1f);
++        // The puppet's own simulation also carries velocity (driving and collision
++        // pushes): pull it toward the real kart's, or a parked kart keeps sliding.
++        auto* dyn = kart->dynamics();
++        const EGG::Vector3f iv = dyn->intVel();
++        dyn->setIntVel(iv + (vel - iv) * 0.25f);
++        if (vel.length() < 0.5f && std::fabs(k.speed / 64.f) < 1.f) { dyn->setIntVel(EGG::Vector3f(0.f, 0.f, 0.f)); dyn->setExtVel(EGG::Vector3f(0.f, 0.f, 0.f)); }
 +    }
 +}
 +
@@ -1962,7 +1972,8 @@ index 0000000..6b5a25d
 +    k.tick = localTick_;
 +    k.pos[0] = pos.x; k.pos[1] = pos.y; k.pos[2] = pos.z;
 +    const float here[3] = {pos.x, pos.y, pos.z};
-+    for (int a = 0; a < 3; ++a) k.vel[a] = pack(here[a] - prevPos_[index][a], 64.f);
++    const float ticks = float(std::max<u32>(1, localTick_ - lastSendTick_));
++    for (int a = 0; a < 3; ++a) k.vel[a] = pack(havePrev_ ? (here[a] - prevPos_[index][a]) / ticks : 0.f, 64.f);
 +    k.rot[0] = pack(rot.v.x, 32767.f); k.rot[1] = pack(rot.v.y, 32767.f); k.rot[2] = pack(rot.v.z, 32767.f); k.rot[3] = pack(rot.w, 32767.f);
 +    k.speed = pack(kart->move()->speed(), 64.f);
 +    return k;
@@ -1977,19 +1988,15 @@ index 0000000..6b5a25d
 +
 +void sendLocal(Kinoko::Kart::KartObject* kart, unsigned buttons, unsigned stickRaw, unsigned trick, bool finished) {
 +    using namespace Kinoko;
-+    ++localTick_;
 +    if (!inRace_) return;
 +    if (role_ == Role::Host && goRepeats_ && now() - goSentAt_ > ms(250)) { --goRepeats_; goSentAt_ = now(); sendSimple(Type::Go); }
-+    if (!havePrev_) rememberPositions();
-+    if (localTick_ % SendEvery) {
-+        // Velocity is measured over the last tick before each update.
-+        if (localTick_ % SendEvery == SendEvery - 1) rememberPositions();
-+        return;
-+    }
++    // Every SendEvery physics ticks (20 a second at full speed, fewer frames or not).
++    if (havePrev_ && localTick_ - lastSendTick_ < SendEvery) return;
 +    const KartState mine = stateOf(0, kart, buttons, stickRaw, trick, finished);
 +    if (role_ == Role::Guest) {
 +        StatePacket p; p.h = header(Type::State); p.k = mine;
 +        send(&p, sizeof p);
++        rememberPositions(); lastSendTick_ = localTick_;
 +        return;
 +    }
 +    // Host: one packet with every kart: its own, each guest's latest and its CPUs.
@@ -2010,8 +2017,14 @@ index 0000000..6b5a25d
 +    }
 +    b.h = header(Type::Bundle, u8(n));
 +    send(&b, sizeof(Header) + n * sizeof(KartState));
++    rememberPositions(); lastSendTick_ = localTick_;
 +}
 +
++void setTick(uint32_t physicsTick) {
++    if (!inRace_) return;
++    if (tickBase_ == ~0u) tickBase_ = physicsTick;
++    localTick_ = physicsTick - tickBase_;
++}
 +void loadStage() { if (inRace_ && !readyWaitStart_) ++loadStages_; }
 +void waitingText(char* out, size_t size) {
 +    out[0] = 0;
